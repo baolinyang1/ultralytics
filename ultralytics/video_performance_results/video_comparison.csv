@@ -1,0 +1,4 @@
+﻿模型,平均推理时间 (ms/帧),关键点稳定性(px),检测覆盖率(%),实时FPS,输出视频
+YOLOv8n,80.99,0.96,100.0,12.35,video_performance_results\still_YOLOv8n.mp4
+YOLO26n,94.21,0.57,100.0,10.61,video_performance_results\still_YOLO26n.mp4
+YOLO26s,192.34,0.55,100.0,5.20,video_performance_results\still_YOLO26s.mp4

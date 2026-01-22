@@ -1,0 +1,4 @@
+﻿模型,平均推理时间 (ms/帧),"耗时抖动(std, ms)",实际FPS,关键点稳定性(px),mAP50,mAP50-95,输出视频
+yolov8n-pose (INT8),23.43,12.36,42.69,1.09,0.7084,0.3795,int8_video_results\still_yolov8n-pose_INT8.mp4
+yolo26n-pose (INT8),25.45,13.50,39.30,1.33,0.7778,0.4491,int8_video_results\still_yolo26n-pose_INT8.mp4
+yolo26s-pose (INT8),32.21,18.83,31.04,0.77,0.7575,0.4567,int8_video_results\still_yolo26s-pose_INT8.mp4

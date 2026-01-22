@@ -1,0 +1,5 @@
+模型    平均推理时间 (ms/帧) 稳定性 (标准差)  实时FPS        输出视频
+YOLOv8n-pose,97.32,         38.69,          10.28, video_performance_results\rock_YOLOv8n.mp4
+YOLO26n-pose,114.96,        60.27,           8.70, video_performance_results\rock_YOLO26n.mp4
+YOLO26s-pose,213.15,        88.63,           4.69, video_performance_results\rock_YOLO26s.mp4
+
