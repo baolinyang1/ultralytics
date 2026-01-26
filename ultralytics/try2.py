@@ -21,7 +21,7 @@ from ultralytics import YOLO
 
 MODEL_PATH = "yolo26s-pose.pt"
 CALIB_DATA = "coco8-pose.yaml"
-VIDEO_SOURCE = "TestVideos/single_25fps.mp4"
+VIDEO_SOURCE = "TestVideos/race1_25fps.mp4"
 LEFT_SHOULDER = 5
 RIGHT_SHOULDER = 6
 LEFT_HIP = 11
@@ -34,7 +34,7 @@ FPS_FALLBACK = 25.0
 MIN_JUMP_FRAMES = 6
 MAX_JUMP_FRAMES = 15
 # Airborne detection, it was 10 before! 
-LIFT_THRESHOLD_PX = 2.5            # was 10 before,ankle_y must be this much "higher" (smaller y) than ground baseline
+LIFT_THRESHOLD_PX = 2.4            # was 10 before,ankle_y must be this much "higher" (smaller y) than ground baseline
 AIRBORNE_CONFIRM_FRAMES = 1       # consecutive frames to confirm airborne, was 2 before!
 GROUND_CONFIRM_FRAMES = 1         # consecutive frames to confirm ground (for landing), was 2 before!
 GROUND_HISTORY_SECONDS = 1.0      # baseline window length
@@ -43,11 +43,11 @@ ANKLE_DISTANCE_THRESHOLD = 20     # px, avg of last few frames, 12 is good enoug
 # Speed / state
 SPM_VALID_MIN = 130
 SPM_VALID_MAX = 240
-STOP_SUDDEN_SEC = 1             # sudden stop if we had stable cadence and then no jumps for this long
-STOP_GRADUAL_SEC = 2.0            # gradual stop if no jumps for this long
+STOP_SUDDEN_SEC = 1.5             # sudden stop if we had stable cadence and then no jumps for this long
+STOP_GRADUAL_SEC = 3.0           # gradual stop if no jumps for this long
 MIN_STABLE_JUMPS_TO_ENTER = 1     # require at least N counted jumps to enter JUMPING
 # Cycle quality gating
-HIP_AMPLITUDE_MIN_PX = 2.5          # require some hip movement amplitude to accept a jump
+HIP_AMPLITUDE_MIN_PX = 2.4          # require some hip movement amplitude to accept a jump
 REFRACTORY_FRAMES = 2             # minimum frames after counting before counting again
 
 # State
@@ -344,7 +344,6 @@ class JumpRopeStateMachine:
                 self.state = JumpRopeState.STOPPED_ACTIVE
 
         elif self.state in (JumpRopeState.STOPPED_ACTIVE, JumpRopeState.STOPPED_TRIPPED):
-            print(f"Stopping state: {self.state}",self._last_seen_count)
             if jump_count > self._last_seen_count:
                 self.state = JumpRopeState.JUMPING
 
