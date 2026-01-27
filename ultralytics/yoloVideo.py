@@ -7,7 +7,7 @@ import cv2
 
 # --- 配置部分 ---
 video_source = "TestVideos/still.mp4"  
-models_to_test = [
+models_to_test =  [
     ("TestModels/yolov8n-pose.pt", "YOLOv8n"),
     ("TestModels/yolo26n-pose.pt", "YOLO26n"),
     ("TestModels/yolo26s-pose.pt", "YOLO26s"),
