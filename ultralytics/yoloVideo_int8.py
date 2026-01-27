@@ -6,39 +6,32 @@ import numpy as np
 import pandas as pd
 from ultralytics import YOLO
 
-
-# --------- 配置部分 ---------
-
-# 要测试的三个 Pose 模型（FP32 权重）
 MODELS_TO_TEST = [
-    "yolov8n-pose.pt",
-    "yolo26n-pose.pt",
-    "yolo26s-pose.pt",
+    "TestModels/yolov8n-pose.pt",
+    "TestModels/yolo26n-pose.pt",
+    "TestModels/yolo26s-pose.pt",
 ]
 
-# 标定 / 验证用数据集（必须有标签，才能计算 mAP）
-CALIB_DATA = "coco8-pose.yaml"  # 也可以换成 coco-pose.yaml 等
+# 标定 / 验证用数据集
+CALIB_DATA = "coco8-pose.yaml" 
 
-# 用于速度测试和可视化的视频
-VIDEO_SOURCE = "still.mp4"
-
-# 统计 FPS 的最大帧数（避免特别长的视频拖太久）
+VIDEO_SOURCE = "TestVideos/still.mp4"
 MAX_FRAMES_FOR_STATS = 500
 
 
 def export_int8_openvino(model_path: str, data_yaml: str) -> Path:
     """
     将 .pt 模型导出为 INT8 OpenVINO 模型，返回导出的模型路径。
-    Ultralytics 会在第一次运行时自动下载标定数据集。
     """
     print(f"\n==> 导出 INT8 OpenVINO 模型: {model_path}")
     base_model = YOLO(model_path)
     export_path = base_model.export(
         format="openvino",
-        int8=True,          # 启用 INT8 量化
-        data=data_yaml,     # 标定数据集, here it does the calibration process
+        int8=True,       
+        data=data_yaml,     
         imgsz=640,
-        verbose=False,
+        #fraction=0.13,
+        nms=True,
     )
     export_path = Path(export_path)
     print(f"    导出完成: {export_path}")
@@ -64,7 +57,7 @@ def benchmark_video_int8(int8_model_path: Path, model_name: str, video_source: s
 
     print(f"    视频属性: {width}x{height}, FPS={fps_src:.2f}")
 
-    # 预热一帧，避免第一帧时间异常
+    # 预热一帧
     ret, warmup_frame = cap.read()
     if ret:
         _ = model.predict(warmup_frame, imgsz=640, verbose=False)
@@ -86,9 +79,10 @@ def benchmark_video_int8(int8_model_path: Path, model_name: str, video_source: s
         # 统计前 MAX_FRAMES_FOR_STATS 帧的总耗时（预处理 + 推理 + 后处理）
         if det_frames < MAX_FRAMES_FOR_STATS:
             dt = r.speed["preprocess"] + r.speed["inference"] + r.speed["postprocess"]
+            
             frame_times.append(dt)
 
-        # 关键点位置收集：只取主目标（首个检测），对每个关键点存位置
+        # 关键点位置收集：取首个检测框，对每个关键点存位置
         try:
             if hasattr(r, "keypoints") and r.keypoints is not None and len(r.keypoints) > 0:
                 track_ids = None
@@ -105,9 +99,9 @@ def benchmark_video_int8(int8_model_path: Path, model_name: str, video_source: s
                 if hasattr(r.keypoints, "conf") and r.keypoints.conf is not None:
                     vis = r.keypoints.conf[0].cpu().numpy()  # (K,)
                     for kpt_idx in range(num_keypoints):
-                        if vis[kpt_idx] > 0.5:
-                            x, y = kpts_xy[kpt_idx]
-                            kpt_positions_by_track[track_id][kpt_idx].append((x, y))
+                        # if vis[kpt_idx] > 0.5:
+                        x, y = kpts_xy[kpt_idx]
+                        kpt_positions_by_track[track_id][kpt_idx].append((x, y))
                 else:
                     for kpt_idx in range(num_keypoints):
                         x, y = kpts_xy[kpt_idx]
@@ -156,28 +150,6 @@ def benchmark_video_int8(int8_model_path: Path, model_name: str, video_source: s
     return avg_dt, std_dt, fps, kpt_stability, det_rate, out_path
 
 
-def eval_map(int8_model_path: Path, data_yaml: str):
-    """
-    在给定数据集上跑一次 val，返回 (mAP50, mAP50-95)。
-    对 pose 模型优先使用 metrics.pose。
-    """
-    print(f"    开始在 {data_yaml} 上计算 mAP...")
-    model = YOLO(int8_model_path)
-    metrics = model.val(data=data_yaml, imgsz=640, verbose=False)
-
-    if hasattr(metrics, "pose"):
-        map50 = float(metrics.pose.map50)
-        map5095 = float(metrics.pose.map)
-    elif hasattr(metrics, "box"):
-        map50 = float(metrics.box.map50)
-        map5095 = float(metrics.box.map)
-    else:
-        map50 = map5095 = 0.0
-
-    print(f"    mAP50={map50:.4f}, mAP50-95={map5095:.4f}")
-    return map50, map5095
-
-
 def main():
     video_path = VIDEO_SOURCE
     if not Path(video_path).exists():
@@ -192,19 +164,16 @@ def main():
     for model_path in MODELS_TO_TEST:
         model_name = Path(model_path).stem
 
-        # 1. 导出 INT8 模型
+        # export, then run on the video!
         int8_path = export_int8_openvino(model_path, CALIB_DATA)
 
-        # 2. 在视频上测试速度并保存处理后的视频
+       
         avg_dt, std_dt, fps, kpt_stability, det_rate, out_video = benchmark_video_int8(
             int8_model_path=int8_path,
             model_name=model_name,
             video_source=video_path,
             out_dir=out_dir,
         )
-
-        # 3. 在标定/验证集上计算 mAP 指标
-        map50, map5095 = eval_map(int8_model_path=int8_path, data_yaml=CALIB_DATA)
 
         all_results.append(
             {
@@ -213,21 +182,18 @@ def main():
                 "耗时抖动(std, ms)": f"{std_dt:.2f}",
                 "实际FPS": f"{fps:.2f}",
                 "关键点稳定性(px)": f"{kpt_stability:.2f}",
-                #"检测覆盖率(%)": f"{det_rate:.1f}",
-                "mAP50": f"{map50:.4f}",
-                "mAP50-95": f"{map5095:.4f}",
                 "输出视频": str(out_video),
             }
         )
 
-    # 4. 汇总结果
+    # summarize results
     if all_results:
         df = pd.DataFrame(all_results)
         csv_path = out_dir / "int8_video_comparison.csv"
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
         print("\n" + "=" * 60)
-        print("INT8 量化后：视频 + mAP 综合对比")
+        print("INT8 量化后：视频对比")
         print("=" * 60)
         print(df.to_string(index=False))
         print(f"\n结果已保存到: {csv_path}")

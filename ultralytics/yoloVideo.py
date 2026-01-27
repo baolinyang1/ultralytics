@@ -6,11 +6,11 @@ from pathlib import Path
 import cv2
 
 # --- 配置部分 ---
-video_source = "still.mp4"  
+video_source = "TestVideos/still.mp4"  
 models_to_test = [
-    ("yolov8n-pose.pt", "YOLOv8n"),
-    ("yolo26n-pose.pt", "YOLO26n"),
-    ("yolo26s-pose.pt", "YOLO26s"),
+    ("TestModels/yolov8n-pose.pt", "YOLOv8n"),
+    ("TestModels/yolo26n-pose.pt", "YOLO26n"),
+    ("TestModels/yolo26s-pose.pt", "YOLO26s"),
 ]
 
 max_frames_for_stats = 300
