@@ -1,74 +1,32 @@
-# finally success to run this model!
-# import cv2
-# import numpy as np
-# from openvino.runtime import Core
-
-# MODEL_PATH = "onnx/model_int8.onnx"
-# IMAGE_PATH = "test.png"
-# IMG_SIZE = 640
-
-# core = Core()
-# model = core.read_model(MODEL_PATH)
-
-# # Compile
-# compiled = core.compile_model(model, "CPU")
-
-# # Input/Output objects
-# input_layer = compiled.input(0)
-# output_layer = compiled.output(0)
-
-# print("Input name:", input_layer.get_any_name())
-# print("Input element type:", input_layer.element_type)
-# print("Input partial shape:", input_layer.partial_shape)  # ✅ dynamic-safe
-
-# print("\nOutput name:", output_layer.get_any_name())
-# print("Output element type:", output_layer.element_type)
-# print("Output partial shape:", output_layer.partial_shape)  # ✅ dynamic-safe
-
-# # ---- Preprocess ----
-# img0 = cv2.imread(IMAGE_PATH)
-# assert img0 is not None, f"Image not found: {IMAGE_PATH}"
-
-# img = cv2.cvtColor(img0, cv2.COLOR_BGR2RGB)
-# img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-# img = img.astype(np.float32) / 255.0
-# img = np.transpose(img, (2, 0, 1))[None, ...]  # NCHW
-
-# # ---- Inference ----
-# out = compiled([img])[output_layer]
-# print("\nInference output shape:", out.shape)
 from pathlib import Path
 import time
-
 import cv2
 import numpy as np
 from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
-MODEL_PATH = "../yolo26n-pose-ONNX/onnx/model_int8.onnx"   
-VIDEO_SOURCE = "TestVideos/still.mp4"
+MODEL_PATH = "../yolo26n-pose-ONNX/onnx/model_int8.onnx"
+VIDEO_SOURCE = "TestVideos/TestImage.png"
 OUT_DIR = Path("onnx_video_results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 IMG_SIZE = 640
 DET_THRESH = 0.5
 KPT_THRESH = 0.3
-MAX_FRAMES_FOR_STATS = 500
 
-# COCO-17 skeleton pairs (index-based)
+# 17 keypoints exist. Skeleton is just which points to CONNECT.
 SKELETON = [
-    (5, 7), (7, 9),      # left arm
-    (6, 8), (8, 10),     # right arm
-    (5, 6),              # shoulders
-    (5, 11), (6, 12),    # torso
-    (11, 12),            # hips
-    (11, 13), (13, 15),  # left leg
-    (12, 14), (14, 16)   # right leg
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (5, 6),
+    (5, 7), (7, 9),
+    (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15),
+    (12, 14), (14, 16),
 ]
 
 
 def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
-    """BGR frame -> model input float32 NCHW (1,3,640,640), RGB, /255."""
     img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
     img = img.astype(np.float32) / 255.0
@@ -76,65 +34,124 @@ def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
     return img
 
 
-def draw_pose(frame_bgr: np.ndarray, det: np.ndarray, w: int, h: int) -> None:
-    """
-    det: [x1,y1,x2,y2,score, ...kpts...]
-    Some exports include 1 extra value after keypoints -> handle both.
-    """
+def clamp01(x: float) -> float:
+    return float(np.clip(x, 0.0, 1.0))
+
+
+def decode_bbox_xyxy_norm(det: np.ndarray):
     x1, y1, x2, y2, score = det[:5]
+    x1, y1, x2, y2 = clamp01(x1), clamp01(y1), clamp01(x2), clamp01(y2)
+    x1, x2 = min(x1, x2), max(x1, x2)
+    y1, y2 = min(y1, y2), max(y1, y2)
+    return x1, y1, x2, y2, float(score)
+
+
+def score_kpt_block(block: np.ndarray) -> float:
+    xs = block[:, 0]
+    ys = block[:, 1]
+    cs = block[:, 2]
+
+    conf_cnt = float(np.sum(cs >= KPT_THRESH))
+    x_spread = float(np.std(xs))
+    y_spread = float(np.std(ys))
+
+    collapse_penalty = 0.0
+    if x_spread < 0.01:
+        collapse_penalty += 5.0
+    if y_spread < 0.01:
+        collapse_penalty += 2.0
+
+    if not np.isfinite(xs).all() or not np.isfinite(ys).all() or not np.isfinite(cs).all():
+        return -1e9
+
+    return conf_cnt * 2.0 + (x_spread + y_spread) * 10.0 - collapse_penalty
+
+
+def find_best_kpt_block(det: np.ndarray) -> tuple[np.ndarray, int, float]:
+    L = det.shape[0]
+    best_score = -1e18
+    best_kpts = None
+    best_start = -1
+
+    for start in range(0, L - 51 + 1):
+        block_flat = det[start:start + 51]
+        block = block_flat.reshape(17, 3).astype(np.float32)
+        sc = score_kpt_block(block)
+        if sc > best_score:
+            best_score = sc
+            best_kpts = block
+            best_start = start
+
+    return best_kpts, best_start, float(best_score)
+
+
+def map_kpts_to_frame(kpts: np.ndarray, bbox_norm: tuple[float, float, float, float], w: int, h: int) -> np.ndarray:
+    x1n, y1n, x2n, y2n = bbox_norm
+    x1p, y1p, x2p, y2p = x1n * w, y1n * h, x2n * w, y2n * h
+
+    xs = kpts[:, 0]
+    ys = kpts[:, 1]
+
+    A = np.stack([xs * w, ys * h], axis=1)
+    B = np.stack([x1p + xs * (x2p - x1p), y1p + ys * (y2p - y1p)], axis=1)
+
+    def inside_score(P: np.ndarray) -> int:
+        Px, Py = P[:, 0], P[:, 1]
+        return int(np.sum((Px >= x1p) & (Px <= x2p) & (Py >= y1p) & (Py <= y2p)))
+
+    if inside_score(B) > inside_score(A):
+        return B
+    return A
+
+
+def draw_pose(frame: np.ndarray, det: np.ndarray, w: int, h: int, debug=False):
+    x1n, y1n, x2n, y2n, score = decode_bbox_xyxy_norm(det)
     if score < DET_THRESH:
         return
 
-    # draw bbox (assumes normalized coords)
-    x1i, y1i = int(x1 * w), int(y1 * h)
-    x2i, y2i = int(x2 * w), int(y2 * h)
-    cv2.rectangle(frame_bgr, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
-    cv2.putText(frame_bgr, f"{score:.2f}", (x1i, max(0, y1i - 6)),
+    x1i, y1i = int(x1n * w), int(y1n * h)
+    x2i, y2i = int(x2n * w), int(y2n * h)
+
+    cv2.rectangle(frame, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
+    cv2.putText(frame, f"{score:.2f}", (x1i, max(0, y1i - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    tail = det[5:]
-    tail_len = tail.shape[0]
+    kpts, start_idx, sc = find_best_kpt_block(det)
+    conf = kpts[:, 2]
+    pts_xy = map_kpts_to_frame(kpts, (x1n, y1n, x2n, y2n), w, h)
 
-    # Try: exact 17*3 first
-    if tail_len == 51:
-        kpts = tail.reshape(17, 3)
+    if debug:
+        cv2.putText(frame, f"kpt_start={start_idx} score={sc:.1f}", (x1i, min(h - 5, y2i + 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    # Your case: 52 -> drop last value (extra field) then reshape
-    elif tail_len == 52:
-        kpts = tail[:-1].reshape(17, 3)
-
-    # General fallback: infer K from length, allow 1 extra value
-    else:
-        if (tail_len - 1) % 3 == 0:
-            k = (tail_len - 1) // 3
-            kpts = tail[:-1].reshape(k, 3)
-        elif tail_len % 3 == 0:
-            k = tail_len // 3
-            kpts = tail.reshape(k, 3)
-        else:
-            # Can't interpret keypoints -> just skip drawing keypoints
-            return
-
-    # draw keypoints + skeleton (if we have at least 17)
-    k = kpts.shape[0]
     pts = []
-    for i in range(k):
-        kx, ky, ks = kpts[i]
-        if ks >= KPT_THRESH:
-            cx, cy = int(kx * w), int(ky * h)
-            pts.append((cx, cy, True))
-            cv2.circle(frame_bgr, (cx, cy), 3, (0, 0, 255), -1)
-        else:
-            pts.append((0, 0, False))
+    for i in range(17):
+        cx, cy = int(pts_xy[i, 0]), int(pts_xy[i, 1])
 
-    # only draw COCO skeleton if kpts has 17 points
-    if k >= 17:
-        for a, b in SKELETON:
-            ax, ay, av = pts[a]
-            bx, by, bv = pts[b]
-            if av and bv:
-                cv2.line(frame_bgr, (ax, ay), (bx, by), (255, 0, 0), 2)
+        # draw ALL keypoints (ignore threshold)
+        cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+        cv2.putText(frame, str(i), (cx + 4, cy - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
+        # still keep "ok" for skeleton lines if you want
+        ok = conf[i] >= KPT_THRESH
+        pts.append((cx, cy, ok))
+
+    for a, b in SKELETON:
+        ax, ay, av = pts[a]
+        bx, by, bv = pts[b]
+        if av and bv:
+            cv2.line(frame, (ax, ay), (bx, by), (255, 0, 0), 2)
+
+
+# ---------------- NEW: ALWAYS PRINT RAW OUTPUT ----------------
+def print_det_array(det: np.ndarray, name: str = "det"):
+    det = det.astype(np.float32).ravel()
+    print(f"\n--- {name} ---")
+    print("length:", det.shape[0])
+    print("min/max:", float(det.min()), float(det.max()))
+    for i, v in enumerate(det):
+        print(f"{i:02d}: {v:.6f}")
 
 
 def main():
@@ -142,102 +159,60 @@ def main():
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    video_path = Path(VIDEO_SOURCE)
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video not found: {video_path}")
+    img_path = Path(VIDEO_SOURCE)
+    if not img_path.exists():
+        raise FileNotFoundError(f"Image not found: {img_path}")
 
-    # ---- Load OpenVINO model ----
     core = Core()
     model = core.read_model(str(model_path))
-
-    # Freeze input shape to avoid dynamic-shape issues
     model.reshape({model.inputs[0]: [1, 3, IMG_SIZE, IMG_SIZE]})
-
     compiled = core.compile_model(model, "CPU")
+
     input_layer = compiled.input(0)
     output_layer = compiled.output(0)
+    # ---- read ONE image ----
+    frame = cv2.imread(str(img_path))
+    if frame is None:
+        raise RuntimeError(f"Could not read image: {img_path}")
 
-    print("Input name:", input_layer.get_any_name())
-    print("Input type:", input_layer.element_type)
-    print("Output name:", output_layer.get_any_name())
-    print("Output type:", output_layer.element_type)
+    h, w = frame.shape[:2]
 
-    # ---- Video IO ----
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+    # ---- run ONE inference ----
+    t0 = time.perf_counter()
+    out = compiled([preprocess(frame)])[output_layer]  # (1,300,57)
+    preds = out[0]
+    dt_ms = (time.perf_counter() - t0) * 1000.0
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps_src = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    print("\n=== RAW MODEL OUTPUT ===")
+    print("preds shape:", preds.shape, "dtype:", preds.dtype)
 
-    out_path = OUT_DIR / f"{video_path.stem}_yolo26n_pose_onnx_openvino.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps_src, (w, h))
+    # Always print a few rows and the top-by-col4 row
+    print_det_array(preds[0], name="preds[0]")
+    if preds.shape[0] > 1:
+        print_det_array(preds[1], name="preds[1]")
+    top_idx = int(np.argmax(preds[:, 4])) if preds.shape[1] > 4 else 0
+    print_det_array(preds[top_idx], name="top_by_preds_col4")
 
-    # ---- Warmup ----
-    ret, frame0 = cap.read()
-    if ret:
-        inp0 = preprocess(frame0)
-        _ = compiled([inp0])[output_layer]
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    # ---- filter + draw ----
+    if preds.shape[1] > 4:
+        preds_f = preds[preds[:, 4] >= DET_THRESH]
+        if len(preds_f) > 0:
+            preds_f = preds_f[np.argsort(-preds_f[:, 4])]
+            for det in preds_f[:3]:
+                draw_pose(frame, det, w, h, debug=True)
 
-    frame_times_ms = []
-    frame_idx = 0
+    # ---- save ONE image ----
+    out_path = OUT_DIR / f"{img_path.stem}_openvino_int8_pose_kpt_autofix.png"
+    cv2.imwrite(str(out_path), frame)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        t0 = time.perf_counter()
-
-        inp = preprocess(frame)
-        out = compiled([inp])[output_layer]  # expected (1, 300, 57)
-        preds = out[0]
-
-        # Filter + sort by score
-        preds = preds[preds[:, 4] >= DET_THRESH]
-        if len(preds) > 0:
-            order = np.argsort(-preds[:, 4])
-            preds = preds[order]
-            # draw top few people
-            for det in preds[:5]:
-                draw_pose(frame, det, w, h)
-
-        t1 = time.perf_counter()
-        dt_ms = (t1 - t0) * 1000.0
-        if frame_idx < MAX_FRAMES_FOR_STATS:
-            frame_times_ms.append(dt_ms)
-
-        # optional FPS overlay
-        cv2.putText(
-            frame, f"{dt_ms:.1f} ms", (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2
-        )
-
-        writer.write(frame)
-        cv2.imshow("yolo26n-pose.onnx (OpenVINO)", frame)
-        if cv2.waitKey(1) & 0xFF == 27:  # ESC
-            break
-
-        frame_idx += 1
-
-    cap.release()
-    writer.release()
+    # ---- show until key press ----
+    cv2.imshow("OpenVINO INT8 Pose (single image)", frame)
+    cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-    if frame_times_ms:
-        avg_ms = float(np.mean(frame_times_ms))
-        std_ms = float(np.std(frame_times_ms))
-        fps = 1000.0 / avg_ms if avg_ms > 0 else 0.0
-    else:
-        avg_ms = std_ms = fps = 0.0
-
     print("\nDone.")
-    print("Saved video:", out_path)
-    print(f"Frames timed: {len(frame_times_ms)}")
-    print(f"Avg time: {avg_ms:.2f} ms | Std: {std_ms:.2f} ms | FPS: {fps:.2f}")
+    print("Saved image:", out_path)
+    print(f"Inference time: {dt_ms:.2f} ms")
 
 
 if __name__ == "__main__":
