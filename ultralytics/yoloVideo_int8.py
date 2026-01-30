@@ -13,9 +13,9 @@ MODELS_TO_TEST = [
 ]
 
 # 标定 / 验证用数据集
-CALIB_DATA = "coco8-pose.yaml" 
+CALIB_DATA = "coco-pose.yaml" 
 
-VIDEO_SOURCE = "TestVideos/still.mp4"
+VIDEO_SOURCE = "TestVideos/still2.mp4"
 MAX_FRAMES_FOR_STATS = 500
 
 
@@ -30,7 +30,7 @@ def export_int8_openvino(model_path: str, data_yaml: str) -> Path:
         int8=True,       
         data=data_yaml,     
         imgsz=640,
-        #fraction=0.13,
+        fraction=0.13,
         nms=True,
     )
     export_path = Path(export_path)

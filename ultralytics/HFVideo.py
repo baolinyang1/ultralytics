@@ -5,7 +5,7 @@ import numpy as np
 from openvino.runtime import Core
 
 MODEL_PATH = "../yolo26n-pose-ONNX/onnx/model_int8.onnx"
-VIDEO_SOURCE = "TestVideos/still.mp4"
+VIDEO_SOURCE = "TestVideos/still2.mp4"
 OUT_DIR = Path("onnx_video_results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -33,11 +33,10 @@ def clamp01(x: float) -> float:
 # model outputs bbox is (x1, y1, x2, y2)
 def decode_bbox_xyxy_norm(det: np.ndarray):
     x1, y1, x2, y2, score = det[:5]
-    x1, y1, x2, y2 = clamp01(x1), clamp01(y1), clamp01(x2), clamp01(y2)
+    #x1, y1, x2, y2 = clamp01(x1), clamp01(y1), clamp01(x2), clamp01(y2)
     x1, x2 = min(x1, x2), max(x1, x2)
     y1, y2 = min(y1, y2), max(y1, y2)
     return x1, y1, x2, y2, float(score)
-
 
 # keypoints start at index 6 (after bbox(4)+conf(1)+class(1)), det is one detection row from YOLO output: those 57 nums
 def decode_kpts_17x3(det: np.ndarray) -> np.ndarray:
@@ -46,13 +45,11 @@ def decode_kpts_17x3(det: np.ndarray) -> np.ndarray:
     # use reshape to get 17x3 array -> (17, 3)
     return kpt_flat.reshape(17, 3).astype(np.float32)
 
-
 def map_kpts_to_frame_fullframe_norm(kpts: np.ndarray, w: int, h: int) -> np.ndarray:
     # keypoints are normalized to full image (0..1), so scale directly
     xs = kpts[:, 0]
     ys = kpts[:, 1]
     return np.stack([xs * w, ys * h], axis=1)
-
 
 def draw_pose(frame: np.ndarray, det: np.ndarray, w: int, h: int):
     x1n, y1n, x2n, y2n, score = decode_bbox_xyxy_norm(det)
@@ -86,12 +83,7 @@ def draw_pose(frame: np.ndarray, det: np.ndarray, w: int, h: int):
         bx, by = pts[b]
         cv2.line(frame, (ax, ay), (bx, by), (255, 0, 0), 2)
 
-
 def compute_kpt_stability_dist(kpt_positions: dict[int, list[tuple[float, float]]]) -> float:
-    """
-    Metric B (recommended): for each keypoint, compute the std of the distance-to-mean (pixel jitter radius),
-    then average over keypoints.
-    """
     kpt_stds = []
     for k in range(17):
         pos = kpt_positions.get(k, [])
@@ -101,6 +93,22 @@ def compute_kpt_stability_dist(kpt_positions: dict[int, list[tuple[float, float]
             d = np.linalg.norm(arr - mean, axis=1) # (N,)
             kpt_stds.append(float(np.std(d)))
     return float(np.mean(kpt_stds)) if kpt_stds else 0.0
+
+def compute_kpt_stds_dist(kpt_positions: dict[int, list[tuple[float, float]]]) -> list[float]:
+    """
+    Return the 17 per-keypoint stds (distance-to-mean). If a keypoint has <2 samples, its std is NaN.
+    """
+    out = []
+    for k in range(17):
+        pos = kpt_positions.get(k, [])
+        if len(pos) >= 2:
+            arr = np.array(pos, dtype=np.float32)  # (N,2)
+            mean = arr.mean(axis=0)
+            d = np.linalg.norm(arr - mean, axis=1)
+            out.append(float(np.std(d)))
+        else:
+            out.append(float("nan"))
+    return out
 
 def main():
     model_path = Path(MODEL_PATH)
@@ -146,6 +154,9 @@ def main():
     kpt_positions: dict[int, list[tuple[float, float]]] = {k: [] for k in range(17)}
     stats_frames_used = 0
 
+    # --- average inference time collection (ms/frame) ---
+    infer_times_ms: list[float] = []
+
     frame_idx = 0
     last_t = time.perf_counter()
 
@@ -157,10 +168,13 @@ def main():
         h, w = frame.shape[:2]
 
         # Inference
-        t0 = time.perf_counter()
+        t0 = time.perf_counter() # start time
         out = compiled([preprocess(frame)])[output_layer]  # (1, N, 57)
         preds = out[0]
         infer_ms = (time.perf_counter() - t0) * 1000.0
+
+        # collect inference time for average
+        infer_times_ms.append(float(infer_ms))
 
         # Filter detections by score
         preds_f = preds[preds[:, 4] >= DET_THRESH]
@@ -192,7 +206,8 @@ def main():
         loop_fps = 1.0 / max(1e-9, (now - last_t))
         last_t = now
 
-        cv2.putText(frame, f"{infer_ms:.1f} ms  |  {loop_fps:.1f} FPS", (30, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        cv2.putText(frame, f"{infer_ms:.1f} ms  |  {loop_fps:.1f} FPS", (30, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
         # Write + show
         writer.write(frame)
@@ -211,10 +226,28 @@ def main():
     # --- stability results ---
     stability_dist = compute_kpt_stability_dist(kpt_positions)
 
+    # --- per-keypoint stds (distance-to-mean) ---
+    kpt_stds = compute_kpt_stds_dist(kpt_positions)
+    valid_stds = [(i, s) for i, s in enumerate(kpt_stds) if np.isfinite(s)]
+
+    if valid_stds:
+        min_kpt, min_std = min(valid_stds, key=lambda t: t[1])
+        max_kpt, max_std = max(valid_stds, key=lambda t: t[1])
+    else:
+        min_kpt = max_kpt = -1
+        min_std = max_std = float("nan")
+
+    # --- average inference time results ---
+    avg_infer_ms = float(np.mean(infer_times_ms)) if infer_times_ms else 0.0
+
     print("\nDone.")
     print("Saved video:", out_path)
     print(f"Stability frames used: {stats_frames_used}")
-    print(f"Keypoint stability (dist std avg): {stability_dist:.2f} px  (lower = more stable)")
+    print(f"Keypoint stability (dist std avg): {stability_dist:.2f} px")
+    print(f"平均推理时间: {avg_infer_ms:.2f} ms/帧")
+    print(f"17个关键点标准差最小: kpt[{min_kpt}] = {min_std:.2f} px")
+    print(f"17个关键点标准差最大: kpt[{max_kpt}] = {max_std:.2f} px")
+    print(f"{valid_stds} valid stds")
 
 
 if __name__ == "__main__":

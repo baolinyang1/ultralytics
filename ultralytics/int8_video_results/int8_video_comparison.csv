@@ -1,4 +1,4 @@
 ﻿模型,平均推理时间 (ms/帧),"耗时抖动(std, ms)",实际FPS,关键点稳定性(px),输出视频
-yolov8n-pose (INT8),22.38,6.12,44.69,1.09,int8_video_results\still_yolov8n-pose_INT8.mp4
-yolo26n-pose (INT8),27.85,22.68,35.91,1.33,int8_video_results\still_yolo26n-pose_INT8.mp4
-yolo26s-pose (INT8),41.17,34.42,24.29,0.77,int8_video_results\still_yolo26s-pose_INT8.mp4
+yolov8n-pose (INT8),19.16,12.07,52.18,0.46,int8_video_results\still2_yolov8n-pose_INT8.mp4
+yolo26n-pose (INT8),24.54,16.54,40.75,0.65,int8_video_results\still2_yolo26n-pose_INT8.mp4
+yolo26s-pose (INT8),35.72,25.59,27.99,0.26,int8_video_results\still2_yolo26s-pose_INT8.mp4
