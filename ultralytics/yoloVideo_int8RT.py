@@ -19,19 +19,18 @@ VIDEO_SOURCE = "TestVideos/Still2.mp4"
 MAX_FRAMES_FOR_STATS = 500
 
 
-def export_int8_openvino(model_path: str, data_yaml: str) -> Path:
+def export_int8_TensorRT(model_path: str, data_yaml: str) -> Path:
     """
-    将 .pt 模型导出为 INT8 OpenVINO 模型，返回导出的模型路径。
+    将 .pt 模型导出为 INT8 TensorRT 模型，返回导出的模型路径。
     """
-    print(f"\n==> 导出 INT8 OpenVINO 模型: {model_path}")
+    print(f"\n==> 导出 INT8 TensorRT 模型: {model_path}")
     base_model = YOLO(model_path)
     export_path = base_model.export(
-        format="openvino",
+        format="engine",
         int8=True,       
         data=data_yaml,     
         imgsz=640,
-        fraction=0.13,
-        nms=True,
+        #fraction=0.13,
     )
     export_path = Path(export_path)
     print(f"    导出完成: {export_path}")
@@ -165,7 +164,7 @@ def main():
         model_name = Path(model_path).stem
 
         # export, then run on the video!
-        int8_path = export_int8_openvino(model_path, CALIB_DATA)
+        int8_path = export_int8_TensorRT(model_path, CALIB_DATA)
 
        
         avg_dt, std_dt, fps, kpt_stability, det_rate, out_video = benchmark_video_int8(
