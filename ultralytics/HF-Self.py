@@ -5,7 +5,7 @@ import numpy as np
 from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
-MODEL_PATH = "yolo26n-pose.dynamic_int8.onnx"
+MODEL_PATH = "yolo26n-pose.static_int8.onnx"
 IMAGE_SOURCE = "TestVideos/TestImage2.png"
 OUT_DIR = Path("onnx_video_results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
