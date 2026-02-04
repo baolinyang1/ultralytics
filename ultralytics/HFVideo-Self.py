@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from openvino.runtime import Core
 
-MODEL_PATH = "../yolo26n-pose-ONNX/onnx/model_int8.onnx"
+MODEL_PATH = "yolo26n-pose.dynamic_int8.onnx"
 VIDEO_SOURCE = "TestVideos/Still2.mp4"
 OUT_DIR = Path("onnx_video_results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -27,46 +27,50 @@ def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
     img = np.transpose(img, (2, 0, 1))[None, ...]  # NCHW
     return img
 
-def clamp01(x: float) -> float:
-    return float(np.clip(x, 0.0, 1.0))
-
-# model outputs bbox is (x1, y1, x2, y2)
-def decode_bbox_xyxy_norm(det: np.ndarray):
+# ---------------- IMPORTANT FIX ----------------
+# Model outputs are in MODEL PIXELS (0..~640), NOT normalized (0..1).
+def decode_bbox_xyxy_modelpx(det: np.ndarray):
     x1, y1, x2, y2, score = det[:5]
-    #x1, y1, x2, y2 = clamp01(x1), clamp01(y1), clamp01(x2), clamp01(y2)
     x1, x2 = min(x1, x2), max(x1, x2)
     y1, y2 = min(y1, y2), max(y1, y2)
-    return x1, y1, x2, y2, float(score)
+    return float(x1), float(y1), float(x2), float(y2), float(score)
 
-# keypoints start at index 6 (after bbox(4)+conf(1)+class(1)), det is one detection row from YOLO output: those 57 nums
 def decode_kpts_17x3(det: np.ndarray) -> np.ndarray:
-    # det length is 57: [0..3]=bbox, [4]=conf, [5]=cls, [6..56]=51 kpt vals
-    kpt_flat = det[6:6 + 51]
-    # use reshape to get 17x3 array -> (17, 3)
+    kpt_flat = det[6:6 + 51]   # 17*3
     return kpt_flat.reshape(17, 3).astype(np.float32)
 
-def map_kpts_to_frame_fullframe_norm(kpts: np.ndarray, w: int, h: int) -> np.ndarray:
-    # keypoints are normalized to full image (0..1), so scale directly
-    xs = kpts[:, 0]
-    ys = kpts[:, 1]
-    return np.stack([xs * w, ys * h], axis=1)
+def map_xy_modelpx_to_frame(xy_model: np.ndarray, w: int, h: int) -> np.ndarray:
+    """
+    xy_model: (N,2) in model pixel space (0..IMG_SIZE)
+    Map to original frame pixels.
+    This assumes preprocess uses direct resize (no letterbox) — which your preprocess does.
+    """
+    sx = w / float(IMG_SIZE)
+    sy = h / float(IMG_SIZE)
+    out = xy_model.astype(np.float32).copy()
+    out[:, 0] *= sx
+    out[:, 1] *= sy
+    return out
 
 def draw_pose(frame: np.ndarray, det: np.ndarray, w: int, h: int):
-    x1n, y1n, x2n, y2n, score = decode_bbox_xyxy_norm(det)
+    x1m, y1m, x2m, y2m, score = decode_bbox_xyxy_modelpx(det)
     if score < DET_THRESH:
         return
 
-    x1i, y1i = int(x1n * w), int(y1n * h)
-    x2i, y2i = int(x2n * w), int(y2n * h)
+    sx = w / float(IMG_SIZE)
+    sy = h / float(IMG_SIZE)
+
+    x1i, y1i = int(x1m * sx), int(y1m * sy)
+    x2i, y2i = int(x2m * sx), int(y2m * sy)
 
     # bbox
     cv2.rectangle(frame, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
     cv2.putText(frame, f"{score:.3f}", (x1i, max(0, y1i - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    # kpts
-    kpts = decode_kpts_17x3(det)
-    pts_xy = map_kpts_to_frame_fullframe_norm(kpts, w, h)
+    # kpts: x,y are modelpx -> map to frame px
+    kpts = decode_kpts_17x3(det)          # (17,3) where x,y in modelpx, conf in 0..1
+    pts_xy = map_xy_modelpx_to_frame(kpts[:, :2], w, h)
 
     # draw ALL keypoints + index labels
     pts = []
@@ -131,7 +135,6 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {vid_path}")
 
-    # Read video properties (fallbacks included)
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps is None or fps <= 1e-6:
         fps = 30.0
@@ -139,8 +142,7 @@ def main():
     in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
     in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
 
-    # Output writer
-    out_path = OUT_DIR / f"{vid_path.stem}_openvino_int8_pose_fixed.mp4"
+    out_path = OUT_DIR / f"{vid_path.stem}_openvino_int8_pose_FIXED.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (in_w, in_h))
     if not writer.isOpened():
@@ -157,7 +159,6 @@ def main():
     # --- average inference time collection (ms/frame) ---
     infer_times_ms: list[float] = []
 
-    frame_idx = 0
     last_t = time.perf_counter()
 
     while True:
@@ -168,40 +169,34 @@ def main():
         h, w = frame.shape[:2]
 
         # Inference
-        t0 = time.perf_counter() # start time
+        t0 = time.perf_counter()
         out = compiled([preprocess(frame)])[output_layer]  # (1, N, 57)
         preds = out[0]
         infer_ms = (time.perf_counter() - t0) * 1000.0
-
-        # collect inference time for average
         infer_times_ms.append(float(infer_ms))
 
-        # Filter detections by score
         preds_f = preds[preds[:, 4] >= DET_THRESH]
 
         if len(preds_f) > 0:
-            # sort high->low score
             preds_f = preds_f[np.argsort(-preds_f[:, 4])]
 
-            # draw top 3, does not matter here coz i have only one person in the video
+            # draw top 3
             for det in preds_f[:3]:
                 draw_pose(frame, det, w, h)
 
-            # collect stability from the TOP detection only (highest score)
+            # collect stability from top detection only
             best = preds_f[0]
-            kpts = decode_kpts_17x3(best)  # (17,3) normalized
-            pts_xy = map_kpts_to_frame_fullframe_norm(kpts, w, h)  # (17,2) pixels
+            kpts = decode_kpts_17x3(best)          # (17,3) modelpx
+            pts_xy = map_xy_modelpx_to_frame(kpts[:, :2], w, h)  # (17,2) frame px
 
             for k in range(17):
                 x, y = float(pts_xy[k, 0]), float(pts_xy[k, 1])
                 kpt_positions[k].append((x, y))
             stats_frames_used += 1
-
         else:
             cv2.putText(frame, "No detections above DET_THRESH", (10, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
-        # FPS overlay (actual loop fps)
         now = time.perf_counter()
         loop_fps = 1.0 / max(1e-9, (now - last_t))
         last_t = now
@@ -209,24 +204,17 @@ def main():
         cv2.putText(frame, f"{infer_ms:.1f} ms  |  {loop_fps:.1f} FPS", (30, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-        # Write + show
         writer.write(frame)
 
-        # ESC to quit
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
-
-        frame_idx += 1
 
     cap.release()
     writer.release()
     cv2.destroyAllWindows()
 
-    # --- stability results ---
     stability_dist = compute_kpt_stability_dist(kpt_positions)
-
-    # --- per-keypoint stds (distance-to-mean) ---
     kpt_stds = compute_kpt_stds_dist(kpt_positions)
     valid_stds = [(i, s) for i, s in enumerate(kpt_stds) if np.isfinite(s)]
 
@@ -237,7 +225,6 @@ def main():
         min_kpt = max_kpt = -1
         min_std = max_std = float("nan")
 
-    # --- average inference time results ---
     avg_infer_ms = float(np.mean(infer_times_ms)) if infer_times_ms else 0.0
 
     print("\nDone.")
