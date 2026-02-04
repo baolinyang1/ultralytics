@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from openvino.runtime import Core
 
-MODEL_PATH = "yolo26n-pose.dynamic_int8.onnx"
+MODEL_PATH = "yolo26n-pose.static_int8.onnx"
 VIDEO_SOURCE = "TestVideos/Still2.mp4"
 OUT_DIR = Path("onnx_video_results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
