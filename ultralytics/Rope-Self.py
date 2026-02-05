@@ -1,14 +1,3 @@
-"""
-Jump Rope Detection - YOLO26s-pose INT8
-Features:
-- Jump rope counting (robust: airborne -> landing event)
-- Single/Double foot jump type
-- State detection (IDLE / JUMPING / STOPPED_ACTIVE / STOPPED_TRIPPED)
-- Speed estimation (SPM)
-- Kalman filter smoothing for keypoints
-"""
-# detector uses kalaman, it is the main part, state machine only controls and updates the state
-
 from pathlib import Path
 import time
 from collections import deque
@@ -17,11 +6,15 @@ from typing import Optional, Tuple, Dict, Any
 import cv2
 import numpy as np
 import pandas as pd
-from ultralytics import YOLO
+from openvino.runtime import Core
 
-MODEL_PATH = "TestModels/yolo26s-pose.pt"
-CALIB_DATA = "coco8-pose.yaml"
-VIDEO_SOURCE = "TestVideos/rock2-25.mp4"
+# ---------------- CONFIG ----------------
+MODEL_PATH = "yolo26n-pose.dynamic_int8.onnx"
+VIDEO_SOURCE = "TestVideos/single_25fps.mp4"
+IMG_SIZE = 640
+DET_THRESH = 0.5
+KPT_CONF_TH = 0.2  # draw threshold for kpt confidence
+# Keypoint indices (COCO-17)
 NOSE = 0
 LEFT_EYE = 1
 RIGHT_EYE = 2
@@ -31,44 +24,49 @@ LEFT_ANKLE = 15
 RIGHT_ANKLE = 16
 FPS_FALLBACK = 25.0
 # Airborne detection
-LIFT_THRESHOLD_PX = 3
+LIFT_THRESHOLD_PX = 1.6
 AIRBORNE_CONFIRM_FRAMES = 1
 GROUND_CONFIRM_FRAMES = 1
 GROUND_HISTORY_SECONDS = 1.0
 # Jump type
-ANKLE_DISTANCE_THRESHOLD = 20
+ANKLE_DISTANCE_THRESHOLD = 18.5
 # Quality gating
-HIP_AMPLITUDE_MIN_PX = 2.4
+HIP_AMPLITUDE_MIN_PX = 1.5
 REFRACTORY_FRAMES = 1
-# STOP detection 
-STOP_SUDDEN_SEC = 1.5  # no new counted jumps for this long => STOPPED_*
+# STOP detection
+STOP_SUDDEN_SEC = 1.5
 # Passive stop (TRIPPED) head event thresholds
-HEAD_EVENT_WINDOW_SEC = 0.45      # head event must be recent (before/around stop)
-HEAD_DROP_BELOW_BASELINE_PX = 5.0 # head drops this many px below normal lowest point during jumping
+HEAD_EVENT_WINDOW_SEC = 0.45
+HEAD_DROP_BELOW_BASELINE_PX = 5.0
 
-# State
+# Skeleton (COCO-17-ish connections; you used this already)
+SKELETON = [
+    (0, 1), (0, 2), (1, 2), (1, 3), (2, 4),
+    (3, 5), (4, 6), (5, 7), (6, 8), (5, 6),
+    (7, 9), (8, 10), (5, 11), (6, 12), (11, 12),
+    (11, 13), (12, 14), (13, 15), (14, 16)
+]
+
+# ---------------- STATE ----------------
 class JumpRopeState(Enum):
     IDLE = "IDLE"
     JUMPING = "JUMPING"
-    STOPPED_ACTIVE = "STOPPED_ACTIVE"   # 主动停止
-    STOPPED_TRIPPED = "STOPPED_TRIPPED" # 被动停止
+    STOPPED_ACTIVE = "STOPPED_ACTIVE"
+    STOPPED_TRIPPED = "STOPPED_TRIPPED"
 
-# Kalman Filter
+# ---------------- KALMAN FILTER ----------------
 class KalmanFilter2D:
-    """2D constant-velocity KF for smoothing (x,y)."""
     def __init__(self, process_noise: float = 0.01, measurement_noise: float = 0.1):
         self.state = np.zeros(4, dtype=np.float32)  # [x,y,vx,vy]
         self.cov = np.eye(4, dtype=np.float32) * 1000.0
 
         self.F = np.array([[1, 0, 1, 0], [0, 1, 0, 1],
                            [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
-
         self.H = np.array([[1, 0, 0, 0],
                            [0, 1, 0, 0]], dtype=np.float32)
 
         self.Q = np.eye(4, dtype=np.float32) * process_noise
         self.R = np.eye(2, dtype=np.float32) * measurement_noise
-
         self.initialized = False
 
     def init(self, x: float, y: float):
@@ -81,7 +79,6 @@ class KalmanFilter2D:
             self.init(x, y)
             return self.state[:2].copy()
 
-        # predict
         self.state = self.F @ self.state
         self.cov = self.F @ self.cov @ self.F.T + self.Q
         z = np.array([x, y], dtype=np.float32)
@@ -90,75 +87,118 @@ class KalmanFilter2D:
         K = self.cov @ self.H.T @ np.linalg.inv(S)
         self.state = self.state + K @ y_res
         self.cov = (np.eye(4, dtype=np.float32) - K @ self.H) @ self.cov
-
         return self.state[:2].copy()
 
 # Utils
-def extract_keypoint_xy(res, kpt_idx: int, conf_th: float = 0.5) -> Optional[Tuple[float, float]]:
-    """Extract a single keypoint (x,y) from a YOLO Results object."""
-    try:
-        if not hasattr(res, "keypoints") or res.keypoints is None:
-            return None
-        if len(res.keypoints) == 0:
-            return None
-
-        kpts = res.keypoints.xy[0].cpu().numpy()  # (K,2)
-        if kpt_idx >= len(kpts):
-            return None
-
-        if hasattr(res.keypoints, "conf") and res.keypoints.conf is not None:
-            conf = res.keypoints.conf[0].cpu().numpy()
-            if conf[kpt_idx] < conf_th:
-                return None
-
-        x, y = kpts[kpt_idx]
-        return float(x), float(y)
-    except Exception:
-        return None
-
 def safe_percentile(arr: np.ndarray, q: float) -> float:
     if arr.size == 0:
         return float("nan")
     return float(np.percentile(arr, q))
 
-# Jump Detector
+def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
+    img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))[None, ...]
+    return img
+
+def decode_bbox_xyxy_modelpx(det57: np.ndarray):
+    x1, y1, x2, y2, score = det57[:5]
+    x1, x2 = min(x1, x2), max(x1, x2)
+    y1, y2 = min(y1, y2), max(y1, y2)
+    return float(x1), float(y1), float(x2), float(y2), float(score)
+
+def decode_kpts_17x3(det57: np.ndarray) -> np.ndarray:
+    kpt_flat = det57[6:6 + 51]
+    return kpt_flat.reshape(17, 3).astype(np.float32)
+
+def map_modelpx_to_frame(xy_model: np.ndarray, w: int, h: int) -> np.ndarray:
+    sx = w / float(IMG_SIZE)
+    sy = h / float(IMG_SIZE)
+    out = xy_model.astype(np.float32).copy()
+    out[:, 0] *= sx
+    out[:, 1] *= sy
+    return out
+
+def extract_keypoint_xy_from_det(
+    det57: np.ndarray, kpt_idx: int, w: int, h: int, conf_th: float = 0.5
+) -> Optional[Tuple[float, float]]:
+    kpts = decode_kpts_17x3(det57)
+    if kpt_idx < 0 or kpt_idx >= 17:
+        return None
+    if float(kpts[kpt_idx, 2]) < conf_th:
+        return None
+    xy_frame = map_modelpx_to_frame(kpts[:, :2], w, h)
+    x, y = xy_frame[kpt_idx]
+    return float(x), float(y)
+
+def draw_pose_overlay(frame: np.ndarray, det57: np.ndarray):
+    """Draw bbox + 17 kpts + skeleton on frame."""
+    h, w = frame.shape[:2]
+    x1m, y1m, x2m, y2m, conf = decode_bbox_xyxy_modelpx(det57)
+
+    if conf < DET_THRESH:
+        return
+
+    sx = w / float(IMG_SIZE)
+    sy = h / float(IMG_SIZE)
+
+    x1, y1 = int(x1m * sx), int(y1m * sy)
+    x2, y2 = int(x2m * sx), int(y2m * sy)
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.putText(frame, f"{conf:.3f}", (x1, max(0, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    kpts = decode_kpts_17x3(det57)              # (17,3) modelpx
+    xy_frame = map_modelpx_to_frame(kpts[:, :2], w, h)
+    kconf = kpts[:, 2]
+
+    pts = []
+    for i in range(17):
+        cx, cy = int(xy_frame[i, 0]), int(xy_frame[i, 1])
+        pts.append((cx, cy))
+
+        if float(kconf[i]) >= KPT_CONF_TH:
+            cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+            cv2.putText(frame, str(i), (cx + 4, cy - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+    for a, b in SKELETON:
+        if float(kconf[a]) >= KPT_CONF_TH and float(kconf[b]) >= KPT_CONF_TH:
+            ax, ay = pts[a]
+            bx, by = pts[b]
+            cv2.line(frame, (ax, ay), (bx, by), (255, 0, 0), 2)
+
+
+# ---------------- JUMP DETECTOR ----------------
 class JumpDetector:
-    """
-    Counting:
-    - ankle_y relative to ground baseline => airborne
-    - count at landing event (airborne -> ground)
-    - gate with hip amplitude + refractory
-    - head_drop_event: nose/eyes sudden big downward move， for passive stop
-    """
     def __init__(self, fps: float):
         self.fps = float(fps)
-        # KF for body
+
         self.kf_lhip = KalmanFilter2D(0.01, 0.1)
         self.kf_rhip = KalmanFilter2D(0.01, 0.1)
         self.kf_lank = KalmanFilter2D(0.01, 0.1)
         self.kf_rank = KalmanFilter2D(0.01, 0.1)
-        # KF for head
+
         self.kf_nose = KalmanFilter2D(0.01, 0.1)
         self.kf_leye = KalmanFilter2D(0.01, 0.1)
         self.kf_reye = KalmanFilter2D(0.01, 0.1)
-        # histories
+
         self.hip_y_hist = deque(maxlen=int(self.fps * 2.0))
         self.ankle_y_hist = deque(maxlen=int(self.fps * GROUND_HISTORY_SECONDS))
         self.ankle_dist_hist = deque(maxlen=10)
-        self.prev_head_xy: Optional[np.ndarray] = None
-        self.head_y_hist = deque(maxlen=int(self.fps * 1.0))  # 1s
-        
-        # normal lowest head Y during jumping (baseline for trip detection)
-        self.normal_lowest_head_y: Optional[float] = None
-        self.jumping_head_y_samples = deque(maxlen=int(self.fps * 2.0))  # track head Y during jumping
 
-        # airborne state
+        self.prev_head_xy: Optional[np.ndarray] = None
+        self.head_y_hist = deque(maxlen=int(self.fps * 1.0))
+
+        self.normal_lowest_head_y: Optional[float] = None
+        self.jumping_head_y_samples = deque(maxlen=int(self.fps * 2.0))
+
         self.airborne_frames = 0
         self.ground_frames = 0
         self.is_airborne = False
-        self.airborne_start_frame: Optional[int] = None
 
-        # counting
         self.jump_count = 0
         self.single_count = 0
         self.double_count = 0
@@ -171,35 +211,17 @@ class JumpDetector:
         arr = np.array(self.ankle_y_hist, dtype=np.float32)
         return safe_percentile(arr, 90.0)
 
-    def _smooth_head(self,
-                     nose: Optional[Tuple[float, float]],
-                     leye: Optional[Tuple[float, float]],
-                     reye: Optional[Tuple[float, float]]) -> Optional[np.ndarray]:
-        """Return head point (x,y) as mean of available (nose/eyes) after KF."""
+    def _smooth_head(self, nose, leye, reye) -> Optional[np.ndarray]:
         pts = []
-        if nose:
-            pts.append(self.kf_nose.update(*nose))
-        if leye:
-            pts.append(self.kf_leye.update(*leye))
-        if reye:
-            pts.append(self.kf_reye.update(*reye))
-        if not pts:
-            return None
-        arr = np.stack(pts, axis=0)  # (n,2)
-        return np.mean(arr, axis=0)
+        if nose: pts.append(self.kf_nose.update(*nose))
+        if leye: pts.append(self.kf_leye.update(*leye))
+        if reye: pts.append(self.kf_reye.update(*reye))
+        if not pts: return None
+        return np.mean(np.stack(pts, axis=0), axis=0)
 
-    def update(
-        self,
-        frame_idx: int,
-        t_sec: float,
-        left_hip: Optional[Tuple[float, float]],
-        right_hip: Optional[Tuple[float, float]],
-        left_ankle: Optional[Tuple[float, float]],
-        right_ankle: Optional[Tuple[float, float]],
-        nose: Optional[Tuple[float, float]],
-        left_eye: Optional[Tuple[float, float]],
-        right_eye: Optional[Tuple[float, float]],
-    ) -> Dict[str, Any]:
+    def update(self, frame_idx: int, t_sec: float,
+               left_hip, right_hip, left_ankle, right_ankle,
+               nose, left_eye, right_eye) -> Dict[str, Any]:
 
         out = {
             "hip_y": 0.0,
@@ -217,11 +239,9 @@ class JumpDetector:
             "head_drop_event": False,
         }
 
-        # need legs+hips to count
         if not (left_hip and right_hip and left_ankle and right_ankle):
             return out
 
-        # smooth body
         lh = self.kf_lhip.update(*left_hip)
         rh = self.kf_rhip.update(*right_hip)
         la = self.kf_lank.update(*left_ankle)
@@ -242,59 +262,39 @@ class JumpDetector:
         self.ankle_dist_hist.append(ankle_dist)
 
         # jump type (single/double)
-        jump_type = "unknown"
         if len(self.ankle_dist_hist) >= 5:
             avg_dist = float(np.mean(list(self.ankle_dist_hist)[-5:]))
-            jump_type = "single" if avg_dist >= ANKLE_DISTANCE_THRESHOLD else "double"
-        out["jump_type"] = jump_type
+            out["jump_type"] = "single" if avg_dist >= ANKLE_DISTANCE_THRESHOLD else "double"
 
-        # head event compute (passive stop)
         head_xy = self._smooth_head(nose, left_eye, right_eye)
         if head_xy is not None:
             head_y = float(head_xy[1])
             out["head_y"] = head_y
-            self.head_y_hist.append(head_y)
-            # Track head Y during jumping to establish normal lowest baseline
-            # Consider actively jumping if we have jump_count > 0 and recent jumps
             is_actively_jumping = False
             if self.jump_count > 0 and len(self.jump_times) > 0:
-                time_since_last_jump = t_sec - self.jump_times[-1]
-                # Consider jumping if last jump was within 2 seconds
-                is_actively_jumping = time_since_last_jump < 2.0
-            
+                is_actively_jumping = (t_sec - self.jump_times[-1]) < 2.0
+
             if is_actively_jumping:
-                # Track head Y samples during jumping
                 self.jumping_head_y_samples.append(head_y)
-                # Update normal lowest head Y using 90th percentile (more robust than max)
-                # max Y = lowest point, since Y increases downward
-                if len(self.jumping_head_y_samples) >= int(self.fps * 0.5):  # Need at least 0.5s of samples
+                if len(self.jumping_head_y_samples) >= int(self.fps * 0.5):
                     arr = np.array(self.jumping_head_y_samples, dtype=np.float32)
                     self.normal_lowest_head_y = safe_percentile(arr, 90.0)
             else:
-                # Not actively jumping - reset baseline if we've been idle too long
                 if len(self.jump_times) == 0 or (t_sec - self.jump_times[-1]) > 3.0:
                     self.normal_lowest_head_y = None
                     self.jumping_head_y_samples.clear()
 
-            # Calculate head movement for display
-            if self.prev_head_xy is None:
-                out["head_move_px"] = 0.0
-            else:
-                move_px = float(np.hypot(head_xy[0] - self.prev_head_xy[0], head_xy[1] - self.prev_head_xy[1]))
-                dy_down = float(head_xy[1] - self.prev_head_xy[1])  # positive => moved down
-                out["head_move_px"] = move_px
+            if self.prev_head_xy is not None:
+                out["head_move_px"] = float(np.hypot(head_xy[0] - self.prev_head_xy[0],
+                                                     head_xy[1] - self.prev_head_xy[1]))
 
-            # Check if head dropped 5 px below normal lowest point during jumping
             out["head_drop_event"] = False
             if self.normal_lowest_head_y is not None:
-                # head_y > normal_lowest_head_y means head moved down (Y increases downward)
-                # If head is 5 px below baseline, trigger trip event
                 if head_y > (self.normal_lowest_head_y + HEAD_DROP_BELOW_BASELINE_PX):
                     out["head_drop_event"] = True
 
             self.prev_head_xy = head_xy
 
-        # baseline + airborne
         ground_y = self._compute_ground_y()
         if ground_y is None:
             return out
@@ -310,11 +310,8 @@ class JumpDetector:
 
         if (not self.is_airborne) and (self.airborne_frames >= AIRBORNE_CONFIRM_FRAMES):
             self.is_airborne = True
-            self.airborne_start_frame = frame_idx
 
         if self.is_airborne and (self.ground_frames >= GROUND_CONFIRM_FRAMES):
-            # landing event candidate
-            # hip amplitude gate
             hip_amp_ok = False
             if len(self.hip_y_hist) >= int(self.fps * 0.4):
                 recent = np.array(list(self.hip_y_hist)[-int(self.fps * 0.4):], dtype=np.float32)
@@ -328,32 +325,29 @@ class JumpDetector:
                 self.last_count_frame = frame_idx
                 self.jump_times.append(t_sec)
 
-                if jump_type == "single":
+                if out["jump_type"] == "single":
                     self.single_count += 1
-                elif jump_type == "double":
+                elif out["jump_type"] == "double":
                     self.double_count += 1
 
             self.is_airborne = False
-            self.airborne_start_frame = None
 
         out["is_airborne"] = self.is_airborne
         out["is_jumping"] = bool(self.is_airborne)
 
-        # freq / spm from counted jumps
         if len(self.jump_times) >= 2:
             intervals = np.diff(np.array(self.jump_times, dtype=np.float32))
             if intervals.size > 0:
                 avg = float(np.mean(intervals[-5:]))
                 if avg > 0:
                     out["freq_hz"] = 1.0 / avg
-                    out["spm"] = out["freq_hz"] * 60.0
+                    out["spm"] = (1.0 / avg) * 60.0
 
         out["jump_count"] = self.jump_count
         out["single_count"] = self.single_count
         out["double_count"] = self.double_count
         return out
 
-# State Machine 
 class JumpRopeStateMachine:
     def __init__(self, fps: float):
         self.fps = float(fps)
@@ -372,7 +366,6 @@ class JumpRopeStateMachine:
         if head_drop_event:
             self.head_event_times.append(t_sec)
 
-        # new jump counted => JUMPING, optimized
         if jump_count > self._last_seen_count:
             self._last_seen_count = jump_count
             self.last_count_time = t_sec
@@ -381,136 +374,137 @@ class JumpRopeStateMachine:
 
         time_since_last = (t_sec - self.last_count_time) if self.last_count_time is not None else 999.0
 
-        # IDLE -> JUMPING once we start counting
-        if self.state == JumpRopeState.IDLE:
-            if jump_count > 0:
-                self.state = JumpRopeState.JUMPING
+        if self.state == JumpRopeState.IDLE and jump_count > 0:
+            self.state = JumpRopeState.JUMPING
 
-        # sudden stop => decide ACTIVE vs TRIPPED
-        if self.state == JumpRopeState.JUMPING:
-            if time_since_last > STOP_SUDDEN_SEC:
-                if self._head_event_recent(t_sec):
-                    self.state = JumpRopeState.STOPPED_TRIPPED   # 被动停止
-                else:
-                    self.state = JumpRopeState.STOPPED_ACTIVE    # 主动停止
+        if self.state == JumpRopeState.JUMPING and time_since_last > STOP_SUDDEN_SEC:
+            self.state = JumpRopeState.STOPPED_TRIPPED if self._head_event_recent(t_sec) else JumpRopeState.STOPPED_ACTIVE
 
-# Drawing
+
 def draw_annotations(frame: np.ndarray, jump_count: int, single_count: int, double_count: int,
-                     state: JumpRopeState, jump_type: str, spm: float,
-                     head_move_px: float, head_drop_event: bool) -> np.ndarray:
-    annotated = frame.copy()
+                     state: JumpRopeState, jump_type: str, spm: float) -> np.ndarray:
+    annotated = frame
 
-    colors = {JumpRopeState.IDLE: (160, 160, 160),JumpRopeState.JUMPING: (0, 255, 0),
-        JumpRopeState.STOPPED_ACTIVE: (0, 165, 255), JumpRopeState.STOPPED_TRIPPED: (0, 0, 255),
+    colors = {JumpRopeState.IDLE: (160, 160, 160),JumpRopeState.JUMPING: (0, 255, 0),JumpRopeState.STOPPED_ACTIVE: (0, 165, 255),JumpRopeState.STOPPED_TRIPPED: (0, 0, 255),
     }
     c = colors.get(state, (255, 255, 255))
 
     y = 30
     cv2.putText(annotated, f"Jump Count: {jump_count} (S:{single_count} D:{double_count})",(10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2)
-    y += 30
-    cv2.putText(annotated, f"State: {state.value}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2)
-    y += 30
-    cv2.putText(annotated, f"Type: {jump_type}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2)
-    y += 30
+    y += 28
+    cv2.putText(annotated, f"State: {state.value}",(10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2)
+    y += 28
+    cv2.putText(annotated, f"Type: {jump_type}",(10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2)
+    y += 28
     cv2.putText(annotated, f"SPM: {spm:.1f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2)
-    y += 30
-    #cv2.putText(annotated, f"DropEvent: {int(head_drop_event)}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
     return annotated
+
 
 def main():
     print("=" * 60)
-    print("Jump Rope Detection")
+    print("Jump Rope Detection (OpenVINO + static INT8 ONNX) + Draw Pose")
     print("=" * 60)
+
     video_path = Path(VIDEO_SOURCE)
+    model_path = Path(MODEL_PATH)
+
     if not video_path.exists():
         print(f"ERROR: video not found: {VIDEO_SOURCE}")
         return
+    if not model_path.exists():
+        print(f"ERROR: model not found: {MODEL_PATH}")
+        return
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         print(f"ERROR: cannot open video: {VIDEO_SOURCE}")
         return
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
     fps_src = cap.get(cv2.CAP_PROP_FPS)
     fps_src = float(fps_src) if fps_src and fps_src > 1e-3 else FPS_FALLBACK
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+
     print(f"Video: {width}x{height}, FPS={fps_src:.2f}, frames={total_frames}")
 
-    model_path = Path(MODEL_PATH)
-    int8_model_path = model_path.parent / f"{model_path.stem}_int8_openvino_model"
-    if not int8_model_path.exists():
-        print("Exporting INT8 OpenVINO model...")
-        try:
-            from ultralytics.yoloVideo_int8 import export_int8_openvino
-            int8_model_path = export_int8_openvino(str(model_path), CALIB_DATA)
-        except Exception as e:
-            print("ERROR: cannot export int8 openvino model. Check your export script/module.")
-            print(e)
-            return
-    else:
-        print(f"Using existing INT8 model: {int8_model_path}")
-
-    model = YOLO(str(int8_model_path))
+    core = Core()
+    model = core.read_model(str(model_path))
+    model.reshape({model.inputs[0]: [1, 3, IMG_SIZE, IMG_SIZE]})
+    compiled = core.compile_model(model, "CPU")
+    output_layer = compiled.output(0)
 
     detector = JumpDetector(fps_src)
     sm = JumpRopeStateMachine(fps_src)
 
     out_dir = Path("jump_rope_results")
     out_dir.mkdir(exist_ok=True)
-    out_video_path = out_dir / f"{video_path.stem}_jump_rope.mp4"
-    out_csv_path = out_dir / f"{video_path.stem}_jump_rope.csv"
+    out_video_path = out_dir / f"{video_path.stem}_jump_rope_openvino_draw.mp4"
+    out_csv_path = out_dir / f"{video_path.stem}_jump_rope_openvino_draw.csv"
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_video_path), fourcc, fps_src, (width, height))
 
     frame_data = []
     frame_idx = 0
-    t0 = time.time()
+    t_start = time.time()
 
-    for res in model.track(
-        source=str(video_path),
-        imgsz=640,
-        stream=True,
-        verbose=False,
-        persist=True,
-    ):
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            break
+
         t_sec = frame_idx / fps_src
-        lhip = extract_keypoint_xy(res, LEFT_HIP)
-        rhip = extract_keypoint_xy(res, RIGHT_HIP)
-        lank = extract_keypoint_xy(res, LEFT_ANKLE)
-        rank = extract_keypoint_xy(res, RIGHT_ANKLE)
-        nose = extract_keypoint_xy(res, NOSE)
-        leye = extract_keypoint_xy(res, LEFT_EYE)
-        reye = extract_keypoint_xy(res, RIGHT_EYE)
 
-        det = detector.update(frame_idx, t_sec, lhip, rhip, lank, rank, nose, leye, reye) #update each frame's keypoints
+        # Inference
+        t0 = time.perf_counter()
+        out = compiled([preprocess(frame)])[output_layer]  # (1, N, 57)
+        preds = out[0]
+        infer_ms = (time.perf_counter() - t0) * 1000.0
 
-        sm.update(t_sec, det["jump_count"], bool(det["head_drop_event"])) #update each frame's state 
+        # Best detection
+        top_idx = int(np.argmax(preds[:, 4]))
+        best = preds[top_idx]
+        best_conf = float(best[4])
 
-        spm = float(det["spm"])
+        # Draw pose overlay (bbox+kpts+skeleton) if confident
+        if best_conf >= DET_THRESH:
+            draw_pose_overlay(frame, best)
 
-        annotated = res.plot()
-        if annotated.shape[0] != height or annotated.shape[1] != width:
-            annotated = cv2.resize(annotated, (width, height))
+        # Extract needed kpts for detector (from best)
+        lhip = rhip = lank = rank = nose = leye = reye = None
+        if best_conf >= DET_THRESH:
+            lhip = extract_keypoint_xy_from_det(best, LEFT_HIP, width, height, conf_th=0.5)
+            rhip = extract_keypoint_xy_from_det(best, RIGHT_HIP, width, height, conf_th=0.5)
+            lank = extract_keypoint_xy_from_det(best, LEFT_ANKLE, width, height, conf_th=0.5)
+            rank = extract_keypoint_xy_from_det(best, RIGHT_ANKLE, width, height, conf_th=0.5)
+            nose = extract_keypoint_xy_from_det(best, NOSE, width, height, conf_th=0.5)
+            leye = extract_keypoint_xy_from_det(best, LEFT_EYE, width, height, conf_th=0.5)
+            reye = extract_keypoint_xy_from_det(best, RIGHT_EYE, width, height, conf_th=0.5)
 
-        annotated = draw_annotations( #draw!!!
-            annotated,
+        det = detector.update(frame_idx, t_sec, lhip, rhip, lank, rank, nose, leye, reye)
+        sm.update(t_sec, det["jump_count"], bool(det["head_drop_event"]))
+
+        annotated = draw_annotations(
+            frame,
             det["jump_count"],
             det["single_count"],
             det["double_count"],
             sm.state,
             det["jump_type"],
-            spm,
-            float(det["head_move_px"]),
-            bool(det["head_drop_event"]),
+            float(det["spm"]),
         )
+
+        cv2.putText(annotated, f"{infer_ms:.1f} ms", (10, height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
         writer.write(annotated)
 
         frame_data.append({
             "frame_idx": frame_idx,
             "timestamp": t_sec,
+            "best_conf": best_conf,
+            "infer_ms": infer_ms,
             "hip_y": det["hip_y"],
             "head_y": det["head_y"],
             "head_move_px": det["head_move_px"],
@@ -522,24 +516,30 @@ def main():
             "double_count": det["double_count"],
             "jump_type": det["jump_type"],
             "freq_hz": det["freq_hz"],
-            "spm": spm,
+            "spm": float(det["spm"]),
             "state": sm.state.value,
         })
 
         frame_idx += 1
-        if frame_idx % 50 == 0 or frame_idx == total_frames:
+        if frame_idx % 50 == 0:
             print(
                 f"Processed {frame_idx}/{total_frames} | "
-                f"total={det['jump_count']} (S:{det['single_count']} D:{det['double_count']}) | "
-                f"state={sm.state.value} | spm={spm:.1f} | "
-                #f"headDrop={int(det['head_drop_event'])}"
+                f"conf={best_conf:.3f} | total={det['jump_count']} "
+                f"(S:{det['single_count']} D:{det['double_count']}) | "
+                f"state={sm.state.value} | spm={float(det['spm']):.1f}"
             )
 
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
     writer.release()
+    cv2.destroyAllWindows()
+
     df = pd.DataFrame(frame_data)
     df.to_csv(out_csv_path, index=False, encoding="utf-8-sig")
 
-    dt = time.time() - t0
+    dt = time.time() - t_start
     print("\nDONE")
     print(f"Total count:  {detector.jump_count}")
     print(f"Single count: {detector.single_count}")
