@@ -9,11 +9,11 @@ import pandas as pd
 from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
-MODEL_PATH = "yolo26n-pose.dynamic_int8.onnx"
-VIDEO_SOURCE = "TestVideos/single_25fps.mp4"
+MODEL_PATH = "yolo26n-pose.static_int8.onnx"
+VIDEO_SOURCE = "TestVideos/rock2_25fps.mp4"
 IMG_SIZE = 640
-DET_THRESH = 0.5
-KPT_CONF_TH = 0.2  # draw threshold for kpt confidence
+DET_THRESH = 0.3
+KPT_CONF_TH = 0.0  # draw threshold for kpt confidence
 # Keypoint indices (COCO-17)
 NOSE = 0
 LEFT_EYE = 1
@@ -24,20 +24,20 @@ LEFT_ANKLE = 15
 RIGHT_ANKLE = 16
 FPS_FALLBACK = 25.0
 # Airborne detection
-LIFT_THRESHOLD_PX = 1.6
+LIFT_THRESHOLD_PX = 2.5
 AIRBORNE_CONFIRM_FRAMES = 1
 GROUND_CONFIRM_FRAMES = 1
 GROUND_HISTORY_SECONDS = 1.0
 # Jump type
-ANKLE_DISTANCE_THRESHOLD = 18.5
+ANKLE_DISTANCE_THRESHOLD = 16.5
 # Quality gating
-HIP_AMPLITUDE_MIN_PX = 1.5
+HIP_AMPLITUDE_MIN_PX = 2.1
 REFRACTORY_FRAMES = 1
 # STOP detection
 STOP_SUDDEN_SEC = 1.5
 # Passive stop (TRIPPED) head event thresholds
 HEAD_EVENT_WINDOW_SEC = 0.45
-HEAD_DROP_BELOW_BASELINE_PX = 5.0
+HEAD_DROP_BELOW_BASELINE_PX = 6
 
 # Skeleton (COCO-17-ish connections; you used this already)
 SKELETON = [
@@ -137,8 +137,8 @@ def draw_pose_overlay(frame: np.ndarray, det57: np.ndarray):
     h, w = frame.shape[:2]
     x1m, y1m, x2m, y2m, conf = decode_bbox_xyxy_modelpx(det57)
 
-    if conf < DET_THRESH:
-        return
+    # if conf < DET_THRESH:
+    #     return
 
     sx = w / float(IMG_SIZE)
     sy = h / float(IMG_SIZE)
@@ -385,8 +385,7 @@ def draw_annotations(frame: np.ndarray, jump_count: int, single_count: int, doub
                      state: JumpRopeState, jump_type: str, spm: float) -> np.ndarray:
     annotated = frame
 
-    colors = {JumpRopeState.IDLE: (160, 160, 160),JumpRopeState.JUMPING: (0, 255, 0),JumpRopeState.STOPPED_ACTIVE: (0, 165, 255),JumpRopeState.STOPPED_TRIPPED: (0, 0, 255),
-    }
+    colors = {JumpRopeState.IDLE: (160, 160, 160),JumpRopeState.JUMPING: (0, 255, 0),JumpRopeState.STOPPED_ACTIVE: (0, 165, 255),JumpRopeState.STOPPED_TRIPPED: (0, 0, 255),}
     c = colors.get(state, (255, 255, 255))
 
     y = 30
@@ -495,8 +494,7 @@ def main():
             float(det["spm"]),
         )
 
-        cv2.putText(annotated, f"{infer_ms:.1f} ms", (10, height - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(annotated, f"{infer_ms:.1f} ms", (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         writer.write(annotated)
 
