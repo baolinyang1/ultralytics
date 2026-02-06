@@ -10,7 +10,7 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "yolo26n-pose.static_int8.onnx"
-VIDEO_SOURCE = "TestVideos/rock2_25fps.mp4"
+VIDEO_SOURCE = "TestVideos/double_25fps.mp4"
 IMG_SIZE = 640
 DET_THRESH = 0.3
 KPT_CONF_TH = 0.0  # draw threshold for kpt confidence
@@ -22,17 +22,16 @@ LEFT_HIP = 11
 RIGHT_HIP = 12
 LEFT_ANKLE = 15
 RIGHT_ANKLE = 16
-FPS_FALLBACK = 25.0
 # Airborne detection
 LIFT_THRESHOLD_PX = 2.5
 AIRBORNE_CONFIRM_FRAMES = 1
-GROUND_CONFIRM_FRAMES = 1
+GROUND_CONFIRM_FRAMES = 2
 GROUND_HISTORY_SECONDS = 1.0
 # Jump type
 ANKLE_DISTANCE_THRESHOLD = 16.5
 # Quality gating
 HIP_AMPLITUDE_MIN_PX = 2.1
-REFRACTORY_FRAMES = 1
+REFRACTORY_FRAMES = 2
 # STOP detection
 STOP_SUDDEN_SEC = 1.5
 # Passive stop (TRIPPED) head event thresholds
@@ -121,12 +120,10 @@ def map_modelpx_to_frame(xy_model: np.ndarray, w: int, h: int) -> np.ndarray:
     return out
 
 def extract_keypoint_xy_from_det(
-    det57: np.ndarray, kpt_idx: int, w: int, h: int, conf_th: float = 0.5
+    det57: np.ndarray, kpt_idx: int, w: int, h: int
 ) -> Optional[Tuple[float, float]]:
     kpts = decode_kpts_17x3(det57)
     if kpt_idx < 0 or kpt_idx >= 17:
-        return None
-    if float(kpts[kpt_idx, 2]) < conf_th:
         return None
     xy_frame = map_modelpx_to_frame(kpts[:, :2], w, h)
     x, y = xy_frame[kpt_idx]
@@ -422,7 +419,7 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
     fps_src = cap.get(cv2.CAP_PROP_FPS)
-    fps_src = float(fps_src) if fps_src and fps_src > 1e-3 else FPS_FALLBACK
+    fps_src = float(fps_src)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
     print(f"Video: {width}x{height}, FPS={fps_src:.2f}, frames={total_frames}")
@@ -473,13 +470,13 @@ def main():
         # Extract needed kpts for detector (from best)
         lhip = rhip = lank = rank = nose = leye = reye = None
         if best_conf >= DET_THRESH:
-            lhip = extract_keypoint_xy_from_det(best, LEFT_HIP, width, height, conf_th=0.5)
-            rhip = extract_keypoint_xy_from_det(best, RIGHT_HIP, width, height, conf_th=0.5)
-            lank = extract_keypoint_xy_from_det(best, LEFT_ANKLE, width, height, conf_th=0.5)
-            rank = extract_keypoint_xy_from_det(best, RIGHT_ANKLE, width, height, conf_th=0.5)
-            nose = extract_keypoint_xy_from_det(best, NOSE, width, height, conf_th=0.5)
-            leye = extract_keypoint_xy_from_det(best, LEFT_EYE, width, height, conf_th=0.5)
-            reye = extract_keypoint_xy_from_det(best, RIGHT_EYE, width, height, conf_th=0.5)
+            lhip = extract_keypoint_xy_from_det(best, LEFT_HIP, width, height)
+            rhip = extract_keypoint_xy_from_det(best, RIGHT_HIP, width, height)
+            lank = extract_keypoint_xy_from_det(best, LEFT_ANKLE, width, height)
+            rank = extract_keypoint_xy_from_det(best, RIGHT_ANKLE, width, height)
+            nose = extract_keypoint_xy_from_det(best, NOSE, width, height)
+            leye = extract_keypoint_xy_from_det(best, LEFT_EYE, width, height)
+            reye = extract_keypoint_xy_from_det(best, RIGHT_EYE, width, height)
 
         det = detector.update(frame_idx, t_sec, lhip, rhip, lank, rank, nose, leye, reye)
         sm.update(t_sec, det["jump_count"], bool(det["head_drop_event"]))
