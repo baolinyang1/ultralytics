@@ -10,7 +10,7 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "yolo26n-pose.static_int8.onnx"
-VIDEO_SOURCE = "TestVideos/race2_25fps.mp4"
+VIDEO_SOURCE = "TestVideos/rock2_25fps.mp4"
 IMG_SIZE = 640
 DET_THRESH = 0.3
 KPT_CONF_TH = 0.0  # draw threshold for kpt confidence
@@ -523,6 +523,24 @@ def main():
                 f"(S:{det['single_count']} D:{det['double_count']}) | "
                 f"state={sm.state.value} | spm={float(det['spm']):.1f}"
             )
+        if frame_idx == total_frames:
+            TypeSum = det['single_count'] + det['double_count']
+            if det['single_count'] > det['double_count']:
+                Type = 'single'
+                print(
+                    f"Processed {frame_idx}/{total_frames} | "
+                    f"conf={best_conf:.3f} | total={det['jump_count']} "
+                    f"(S:{TypeSum}) | "
+                    f"Type={Type} | spm={float(det['spm']):.1f}"
+                )
+            else:
+                Type = 'double'
+                print(
+                    f"Processed {frame_idx}/{total_frames} | "
+                    f"conf={best_conf:.3f} | total={det['jump_count']} "
+                    f"(D:{TypeSum}) | "
+                    f"Type={Type} | spm={float(det['spm']):.1f}"
+                )
 
         if cv2.waitKey(1) & 0xFF == 27:
             break
@@ -537,8 +555,8 @@ def main():
     dt = time.time() - t_start
     print("\nDONE")
     print(f"Total count:  {detector.jump_count}")
-    print(f"Single count: {detector.single_count}")
-    print(f"Double count: {detector.double_count}")
+    # print(f"Single count: {detector.single_count}")
+    # print(f"Double count: {detector.double_count}")
     print(f"Output video: {out_video_path}")
     print(f"Output csv:   {out_csv_path}")
     print(f"Time: {dt:.2f}s")
