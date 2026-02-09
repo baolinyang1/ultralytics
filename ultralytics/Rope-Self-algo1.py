@@ -10,7 +10,7 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "yolo26n-pose.static_int8.onnx"
-VIDEO_SOURCE = "TestVideos/double_25fps.mp4"
+VIDEO_SOURCE = "TestVideos/race2_25fps.mp4"
 IMG_SIZE = 640
 DET_THRESH = 0.3
 KPT_CONF_TH = 0.0  # draw threshold for kpt confidence
@@ -23,14 +23,14 @@ RIGHT_HIP = 12
 LEFT_ANKLE = 15
 RIGHT_ANKLE = 16
 # Airborne detection
-LIFT_THRESHOLD_PX = 2.5
+LIFT_THRESHOLD_PX = 2.4
 AIRBORNE_CONFIRM_FRAMES = 1
 GROUND_CONFIRM_FRAMES = 2
 GROUND_HISTORY_SECONDS = 1.0
 # Jump type
 ANKLE_DISTANCE_THRESHOLD = 16.5
 # Quality gating
-HIP_AMPLITUDE_MIN_PX = 2.1
+HIP_AMPLITUDE_MIN_PX = 2.0
 REFRACTORY_FRAMES = 2
 # STOP detection
 STOP_SUDDEN_SEC = 1.5
