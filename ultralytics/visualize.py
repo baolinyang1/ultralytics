@@ -1,7 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-csv_path = "jump_rope_results/race4_25fps_jump_rope_openvino_draw.csv"
+csv_path = "jump_rope_results/race2_25fps_jump_rope_openvino_draw_patched.csv"
 df = pd.read_csv(csv_path)
 
 hip_y_index = df.columns.get_loc("hip_y")

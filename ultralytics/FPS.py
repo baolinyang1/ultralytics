@@ -1,8 +1,8 @@
 import cv2
 
 # Settings
-input_path = "TestVideos/race5.mp4"
-output_path = "TestVideos/race5_25fps.mp4"
+input_path = "TestVideos/1055.mp4"
+output_path = "TestVideos/1055_25fps.mp4"
 target_fps = 25.0
 
 # Open input video
