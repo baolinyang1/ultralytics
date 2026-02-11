@@ -10,12 +10,12 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "yolo26n-pose.static_int8.onnx"
-VIDEO_SOURCE = "TestVideos/1053_25fps.mp4"
+VIDEO_SOURCE = "TestVideos/sport3_25fps.mp4"
 IMG_SIZE = 640
 
 DET_THRESH = 0.3
 
-# Only accept keypoints if their own confidence is >= this (important!)
+# Only accept keypoints if their own confidence is >= this 
 MIN_KPT_CONF = 0.25
 
 # Keypoint indices (COCO-17)
@@ -261,7 +261,7 @@ class JumpDetector:
         # These ratios are good starting points and work better across videos.
         lift_th = 0.013 * person_h        # airborne lift threshold
         hip_amp_min = 0.012 * person_h      # minimum hip motion
-        ankle_dist_th = 18             # single vs double
+        ankle_dist_th = 25             # single vs double
         head_drop_th = 0.025 * person_h   # head drop event threshold
 
         out = {
@@ -346,7 +346,7 @@ class JumpDetector:
         out["ground_y"] = float(ground_y)
         self._last_ground_y = float(ground_y)
 
-        airborne_now = ankle_y <= (ground_y - lift_th * 1.8)
+        airborne_now = ankle_y <= (ground_y - lift_th * 1.2)
 
         if airborne_now:
             self.airborne_frames += 1
