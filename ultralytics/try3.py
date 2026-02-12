@@ -11,7 +11,7 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "yolo26n-pose.static_int8.onnx"
-VIDEO_SOURCE = "TestVideos/sport3_25fps.mp4"
+VIDEO_SOURCE = "TestVideos/sport2_25fps.mp4"
 IMG_SIZE = 640
 
 DET_THRESH = 0.3
@@ -30,12 +30,32 @@ GROUND_CONFIRM_FRAMES = 1
 REFRACTORY_FRAMES = 7
 STOP_SUDDEN_SEC = 1.5
 
-# ---- CYCLE CHECKS (THE IMPORTANT PART) ----
-# Jump rope cadence is usually stable; walking/random isn't.
-MIN_JUMP_INTERVAL_SEC = 0.25   # faster than this is probably noise
-MAX_JUMP_INTERVAL_SEC = 1.50   # slower than this is probably not jump rope
-CYCLE_WINDOW = 4               # how many recent intervals to check (3-5 works)
-CYCLE_CV_MAX = 0.22            # coefficient of variation threshold (std/mean)
+# ---------------- CYCLE CHECKS (IMPROVED) ----------------
+CYCLE_WINDOW = 4
+INTERVAL_TOL = 0.22
+ALLOWED_OUTLIERS = 1
+MIN_JUMP_INTERVAL_SEC = 0.23
+MAX_JUMP_INTERVAL_SEC = 1.70
+
+# cadence tracking (adaptive)
+EWMA_ALPHA = 0.22
+MAD_K = 3.0
+MIN_MAD_SEC = 0.03
+
+# amplitude gate (stop/walk suppression)
+AMP_FRAC = 0.020
+AMP_MIN_PX = 6.0
+
+# ---------------- DYNAMIC LIFT THRESHOLD ----------------
+# lift_th computed from BOTH:
+#   - noise floor near ground (robust sigma)
+#   - expected jump amplitude (EWMA)
+LIFT_BASE_FRAC = 0.010     # fallback when no amp_ewma yet (was 0.013)
+AMP_TO_LIFT = 0.35         # lift_th = AMP_TO_LIFT * amp_ewma  (0.25~0.45)
+NOISE_K = 3.0              # lift_th >= NOISE_K * sigma_noise
+MIN_LIFT_PX = 4.0          # absolute min lift threshold
+MAX_LIFT_FRAC = 0.050      # lift_th <= MAX_LIFT_FRAC * person_h
+AMP_EWMA_ALPHA = 0.25      # how fast amp_ewma adapts
 
 # Skeleton (drawing only)
 SKELETON = [
@@ -151,12 +171,14 @@ def draw_pose(frame: np.ndarray, det57: np.ndarray):
         if float(kc[a]) >= MIN_KPT_CONF and float(kc[b]) >= MIN_KPT_CONF:
             cv2.line(frame, pts[a], pts[b], (255, 0, 0), 2)
 
-# ---------------- JUMP DETECTOR (WITH CYCLE CHECKS) ----------------
+# ---------------- JUMP DETECTOR ----------------
 class JumpDetector:
     """
-    Base idea:
-    - detect candidate jumps from airborne->landing
-    - BUT accept count only when cadence is consistent (cycle checks)
+    Candidate event: airborne -> landing.
+    Improvements:
+      - dynamic lift_th (noise + amplitude EWMA)
+      - cadence voting (robust, allows drift)
+      - amplitude gate to suppress stop/walk jitter
     """
 
     def __init__(self, fps: float):
@@ -175,38 +197,93 @@ class JumpDetector:
         self.ground_frames = 0
         self.is_airborne = False
 
+        # track min ankle_y while airborne
+        self.air_min_y: Optional[float] = None
+
         self.jump_count = 0
         self.single_count = 0
         self.double_count = 0
         self.last_count_frame = -10_000
 
-        # cycle tracking
-        self.land_times = deque(maxlen=10)   # timestamps of accepted/provisional landings
-        self.jump_times = deque(maxlen=50)   # accepted jump timestamps (for SPM)
+        # cadence
+        self.jump_times = deque(maxlen=50)
+        self.interval_hist = deque(maxlen=20)
+        self.expected_interval: Optional[float] = None
 
-    def _cycle_ok(self) -> bool:
+        # amplitude EWMA (for dynamic lift)
+        self.amp_ewma: Optional[float] = None
+
+    def _reset_cadence(self):
+        self.jump_times.clear()
+        self.interval_hist.clear()
+        self.expected_interval = None
+        # do NOT reset amp_ewma; amplitude still useful
+
+    @staticmethod
+    def _robust_sigma(vals: np.ndarray) -> float:
+        """Robust sigma estimate from MAD."""
+        if vals.size == 0:
+            return 0.0
+        med = float(np.median(vals))
+        mad = float(np.median(np.abs(vals - med)))
+        return 1.4826 * mad
+
+    def _estimate_ground_noise_sigma(self, ankle_hist: deque, ground_y: float) -> float:
         """
-        Check if recent landing intervals are consistent:
-          - enough samples
-          - each interval in [MIN, MAX]
-          - coefficient of variation (std/mean) <= CYCLE_CV_MAX
+        Estimate measurement noise near ground:
+        take samples close to ground (top tail of y) to avoid airborne points.
         """
-        if len(self.land_times) < (CYCLE_WINDOW + 1):
-            return False
+        arr = np.array(ankle_hist, dtype=np.float32)
+        if arr.size < 10:
+            return 0.0
 
-        ts = np.array(self.land_times, dtype=np.float32)
-        intervals = np.diff(ts)[-CYCLE_WINDOW:]  # last CYCLE_WINDOW intervals
+        # keep points within 12% of (max-min) below ground_y (ground neighborhood)
+        span = float(arr.max() - arr.min())
+        band = max(6.0, 0.12 * span)
+        near = arr[arr >= (ground_y - band)]
+        if near.size < 6:
+            near = arr  # fallback
 
-        if np.any(intervals < MIN_JUMP_INTERVAL_SEC) or np.any(intervals > MAX_JUMP_INTERVAL_SEC):
-            return False
+        sigma = self._robust_sigma(near)
+        return float(max(0.0, sigma))
 
-        mean_i = float(np.mean(intervals))
-        std_i = float(np.std(intervals))
-        if mean_i <= 1e-6:
-            return False
+    def _dynamic_lift_th(self, person_h: float, ground_sigma: float) -> float:
+        # amplitude-driven part
+        if self.amp_ewma is None:
+            lift_from_amp = LIFT_BASE_FRAC * person_h
+        else:
+            lift_from_amp = AMP_TO_LIFT * float(self.amp_ewma)
 
-        cv = std_i / mean_i
-        return cv <= CYCLE_CV_MAX
+        # noise-driven part
+        lift_from_noise = NOISE_K * float(ground_sigma)
+
+        lift_th = max(MIN_LIFT_PX, lift_from_amp, lift_from_noise)
+        lift_th = min(lift_th, MAX_LIFT_FRAC * person_h)
+        return float(lift_th)
+
+    def _cycle_vote_ok(self, dt: float) -> bool:
+        tmp = list(self.interval_hist) + [float(dt)]
+        if len(tmp) < CYCLE_WINDOW:
+            return True
+
+        window = np.array(tmp[-CYCLE_WINDOW:], dtype=np.float32)
+
+        base = float(self.expected_interval) if self.expected_interval else float(np.median(window))
+        # robust tol from recent intervals
+        if len(self.interval_hist) == 0:
+            mad = MIN_MAD_SEC
+        else:
+            hist = np.array(self.interval_hist, dtype=np.float32)
+            med = float(np.median(hist))
+            mad = float(np.median(np.abs(hist - med)))
+            mad = max(mad, MIN_MAD_SEC)
+
+        base_tol = max(INTERVAL_TOL * base, MAD_K * mad)
+        lo = base - base_tol
+        hi = base + base_tol
+
+        good = int(np.sum((window >= lo) & (window <= hi)))
+        return good >= (CYCLE_WINDOW - ALLOWED_OUTLIERS)
 
     def update(self, frame_idx: int, t_sec: float,
                lhip, rhip, lank, rank,
@@ -221,18 +298,23 @@ class JumpDetector:
             "spm": 0.0,
             "ground_y": float("nan"),
             "lift_th": float("nan"),
+            "lift_noise_sigma": float("nan"),
+            "amp_ewma": float("nan"),
             "ankle_distance": 0.0,
             "hip_y": 0.0,
             "cycle_ok": False,
+            "dt": float("nan"),
+            "expected_dt": float("nan"),
+            "amp": float("nan"),
+            "min_air_y": float("nan"),
         }
 
         if not (lhip and rhip and lank and rank) or person_h <= 1.0:
             return out
 
-        # thresholds normalized by height
-        lift_th = 0.013 * person_h
         hip_amp_min = 0.012 * person_h
         ankle_dist_th = 25
+        amp_th = max(AMP_MIN_PX, AMP_FRAC * person_h)
 
         lh = self.kf_lhip.update(*lhip)
         rh = self.kf_rhip.update(*rhip)
@@ -245,7 +327,6 @@ class JumpDetector:
 
         out["hip_y"] = hip_y
         out["ankle_distance"] = ankle_dist
-        out["lift_th"] = float(lift_th)
 
         self.hip_y_hist.append(hip_y)
         self.ankle_y_hist.append(ankle_y)
@@ -258,8 +339,16 @@ class JumpDetector:
         if len(self.ankle_y_hist) < 10:
             return out
 
+        # ground estimate
         ground_y = float(np.percentile(np.array(self.ankle_y_hist, dtype=np.float32), 90.0))
         out["ground_y"] = ground_y
+
+        # dynamic lift threshold
+        sigma = self._estimate_ground_noise_sigma(self.ankle_y_hist, ground_y)
+        lift_th = self._dynamic_lift_th(person_h, sigma)
+        out["lift_noise_sigma"] = float(sigma)
+        out["lift_th"] = float(lift_th)
+        out["amp_ewma"] = float(self.amp_ewma) if self.amp_ewma is not None else float("nan")
 
         airborne_now = ankle_y <= (ground_y - lift_th)
 
@@ -270,12 +359,20 @@ class JumpDetector:
             self.ground_frames += 1
             self.airborne_frames = 0
 
+        # enter airborne
         if (not self.is_airborne) and (self.airborne_frames >= AIRBORNE_CONFIRM_FRAMES):
             self.is_airborne = True
+            self.air_min_y = ankle_y
 
-        # landing -> candidate event
+        # while airborne, track min ankle y
+        if self.is_airborne:
+            if self.air_min_y is None:
+                self.air_min_y = ankle_y
+            else:
+                self.air_min_y = float(min(self.air_min_y, ankle_y))
+
+        # landing -> candidate
         if self.is_airborne and (self.ground_frames >= GROUND_CONFIRM_FRAMES):
-            # hip amplitude gate (still needed to avoid tiny noise)
             hip_amp_ok = False
             if len(self.hip_y_hist) >= max(3, int(self.fps * 0.35)):
                 recent = np.array(self.hip_y_hist, dtype=np.float32)
@@ -283,33 +380,71 @@ class JumpDetector:
 
             refractory_ok = (frame_idx - self.last_count_frame) >= REFRACTORY_FRAMES
 
-            if hip_amp_ok and refractory_ok:
-                # record landing time (for cadence check)
-                self.land_times.append(t_sec)
+            min_air_y = self.air_min_y if self.air_min_y is not None else ankle_y
+            amp = float(ground_y - float(min_air_y))
+            out["amp"] = amp
+            out["min_air_y"] = float(min_air_y)
 
-                cycle_ok = self._cycle_ok()
-                out["cycle_ok"] = cycle_ok
-
-                # Warm-up: allow first 2 jumps to seed the cadence,
-                # after that require cadence consistency.
-                allow = (self.jump_count < 2) or cycle_ok
-
-                if allow:
-                    self.jump_count += 1
-                    self.last_count_frame = frame_idx
-                    self.jump_times.append(t_sec)
-
-                    if out["jump_type"] == "single":
-                        self.single_count += 1
-                    else:
-                        self.double_count += 1
-
+            # reset airborne segment
             self.is_airborne = False
+            self.air_min_y = None
+
+            if hip_amp_ok and refractory_ok:
+                dt = None
+                if len(self.jump_times) >= 1:
+                    dt = float(t_sec - float(self.jump_times[-1]))
+                    out["dt"] = dt
+
+                    if dt < MIN_JUMP_INTERVAL_SEC:
+                        return out
+                    if dt > MAX_JUMP_INTERVAL_SEC:
+                        self._reset_cadence()
+                        return out
+
+                # amplitude gate
+                if amp < amp_th:
+                    return out
+
+                # cadence check
+                cycle_ok = True
+                if dt is not None:
+                    cycle_ok = self._cycle_vote_ok(dt)
+                out["cycle_ok"] = bool(cycle_ok)
+                if not cycle_ok:
+                    return out
+
+                # ACCEPT
+                self.jump_count += 1
+                self.last_count_frame = frame_idx
+                self.jump_times.append(float(t_sec))
+
+                # update interval EWMA
+                if dt is not None:
+                    self.interval_hist.append(float(dt))
+                    if self.expected_interval is None:
+                        self.expected_interval = float(dt)
+                    else:
+                        self.expected_interval = float((1.0 - EWMA_ALPHA) * self.expected_interval + EWMA_ALPHA * dt)
+                    out["expected_dt"] = float(self.expected_interval)
+
+                # update amplitude EWMA (drives lift_th)
+                if self.amp_ewma is None:
+                    self.amp_ewma = float(amp)
+                else:
+                    self.amp_ewma = float((1.0 - AMP_EWMA_ALPHA) * self.amp_ewma + AMP_EWMA_ALPHA * amp)
+                out["amp_ewma"] = float(self.amp_ewma)
+
+                if out["jump_type"] == "single":
+                    self.single_count += 1
+                else:
+                    self.double_count += 1
 
         out["is_airborne"] = self.is_airborne
         out["jump_count"] = self.jump_count
         out["single_count"] = self.single_count
         out["double_count"] = self.double_count
+        if self.expected_interval is not None:
+            out["expected_dt"] = float(self.expected_interval)
 
         if len(self.jump_times) >= 2:
             intervals = np.diff(np.array(self.jump_times, dtype=np.float32))
@@ -349,10 +484,13 @@ def draw_hud(frame: np.ndarray, det: Dict[str, Any], state: JumpRopeState, infer
     y += 26
     cv2.putText(frame, f"State: {state.value}  Type: {det['jump_type']}  SPM: {det['spm']:.1f}",
                 (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
-    y += 26
-    cv2.putText(frame, f"cycle_ok: {bool(det.get('cycle_ok', False))}",
-                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    y += 26
+    y += 24
+    cv2.putText(frame, f"lift={det.get('lift_th', float('nan')):.1f}  sigma={det.get('lift_noise_sigma', float('nan')):.2f}  ampEWMA={det.get('amp_ewma', float('nan')):.1f}",
+                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    y += 22
+    cv2.putText(frame, f"cycle_ok={bool(det.get('cycle_ok', False))} dt={det.get('dt', float('nan')):.2f} exp={det.get('expected_dt', float('nan')):.2f} amp={det.get('amp', float('nan')):.1f}",
+                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    y += 22
     cv2.putText(frame, f"{infer_ms:.1f} ms",
                 (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
@@ -378,13 +516,14 @@ def main():
     detector = JumpDetector(fps)
     sm = JumpRopeStateMachine()
 
-    out_video_path = "jump_rope_results/jump_rope_cycle_checked.mp4"
-    out_csv_path = "jump_rope_results/jump_rope_cycle_checked.csv"
+    out_video_path = "jump_rope_results/jump_rope_dynamic_lift.mp4"
+    out_csv_path = "jump_rope_results/jump_rope_dynamic_lift.csv"
     writer = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     frame_data = []
     frame_idx = 0
     prev_center = None
+    prev_h = None
 
     while True:
         ok, frame = cap.read()
@@ -402,22 +541,31 @@ def main():
             frame_idx += 1
             continue
 
-        # track same person by nearest bbox center
+        # tracking: nearest center, prefer similar bbox height
         if prev_center is None:
             best = valid[int(np.argmax(valid[:, 4]))]
         else:
             centers = np.array([bbox_center_modelpx(d) for d in valid], dtype=np.float32)
-            dx = centers[:, 0] - float(prev_center[0])
-            dy = centers[:, 1] - float(prev_center[1])
-            best = valid[int(np.argmin(dx * dx + dy * dy))]
+            dist2 = (centers[:, 0] - float(prev_center[0])) ** 2 + (centers[:, 1] - float(prev_center[1])) ** 2
+
+            heights = np.array([bbox_height_px(d, width, height) for d in valid], dtype=np.float32)
+            if prev_h is not None and prev_h > 1.0:
+                mask = (heights >= 0.7 * prev_h) & (heights <= 1.3 * prev_h)
+                if np.any(mask):
+                    idxs = np.where(mask)[0]
+                    best = valid[idxs[int(np.argmin(dist2[idxs]))]]
+                else:
+                    best = valid[int(np.argmin(dist2))]
+            else:
+                best = valid[int(np.argmin(dist2))]
 
         prev_center = bbox_center_modelpx(best)
+        prev_h = bbox_height_px(best, width, height)
         best_conf = float(best[4])
 
         draw_pose(frame, best)
 
         person_h = bbox_height_px(best, width, height)
-
         lhip = get_kpt_xy(best, LEFT_HIP, width, height)
         rhip = get_kpt_xy(best, RIGHT_HIP, width, height)
         lank = get_kpt_xy(best, LEFT_ANKLE, width, height)
@@ -441,6 +589,17 @@ def main():
             "spm": det["spm"],
             "state": sm.state.value,
             "cycle_ok": bool(det.get("cycle_ok", False)),
+            "dt": det.get("dt", float("nan")),
+            "expected_dt": det.get("expected_dt", float("nan")),
+            "amp": det.get("amp", float("nan")),
+            "amp_ewma": det.get("amp_ewma", float("nan")),
+            "lift_th": det.get("lift_th", float("nan")),
+            "lift_noise_sigma": det.get("lift_noise_sigma", float("nan")),
+            "min_air_y": det.get("min_air_y", float("nan")),
+            "ground_y": det.get("ground_y", float("nan")),
+            "ankle_distance": det.get("ankle_distance", 0.0),
+            "hip_y": det.get("hip_y", 0.0),
+            "is_airborne": det.get("is_airborne", False),
         })
 
         frame_idx += 1
