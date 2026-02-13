@@ -8,10 +8,9 @@ import cv2
 import numpy as np
 import pandas as pd
 from openvino.runtime import Core
-
 # ---------------- CONFIG ----------------
 MODEL_PATH = "yolo26n-pose.static_int8.onnx"
-VIDEO_SOURCE = "TestVideos/sport31_25fps.mp4"
+VIDEO_SOURCE = "TestVideos/sport13_25fps.mp4"
 IMG_SIZE = 640
 
 DET_THRESH = 0.3
@@ -159,8 +158,8 @@ def draw_pose(frame: np.ndarray, det57: np.ndarray):
     x1, y1, x2, y2 = int(x1m * sx), int(y1m * sy), int(x2m * sx), int(y2m * sy)
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    cv2.putText(frame, f"{conf:.2f}", (x1, max(0, y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    #cv2.putText(frame, f"{conf:.2f}", (x1, max(0, y1 - 6)),
+    #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     kpts = decode_kpts_17x3(det57)
     xy = map_modelpx_to_frame(kpts[:, :2], w, h)
@@ -513,18 +512,18 @@ def draw_hud(frame: np.ndarray, det: Dict[str, Any], state: JumpRopeState, infer
     y += 26
     cv2.putText(frame, f"State: {state.value}  Type: {det['jump_type']}  SPM: {det['spm']:.1f}",
                 (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
-    y += 24
-    cv2.putText(frame, f"hip lift={det.get('lift_th', float('nan')):.1f}  sigma={det.get('lift_noise_sigma', float('nan')):.2f}  ampEWMA={det.get('amp_ewma', float('nan')):.1f}",
-                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    y += 22
-    cv2.putText(frame, f"cycle_ok={bool(det.get('cycle_ok', False))} dt={det.get('dt', float('nan')):.2f} exp={det.get('expected_dt', float('nan')):.2f}",
-                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    y += 22
-    cv2.putText(frame, f"hip_amp={det.get('amp', float('nan')):.1f}  sho_amp={det.get('shoulder_amp', float('nan')):.1f}",
-                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    y += 22
-    cv2.putText(frame, f"{infer_ms:.1f} ms",
-                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    #y += 24
+    #cv2.putText(frame, f"hip lift={det.get('lift_th', float('nan')):.1f}  sigma={det.get('lift_noise_sigma', float('nan')):.2f}  ampEWMA={det.get('amp_ewma', float('nan')):.1f}",
+    #            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    #y += 22
+    #cv2.putText(frame, f"cycle_ok={bool(det.get('cycle_ok', False))} dt={det.get('dt', float('nan')):.2f} exp={det.get('expected_dt', float('nan')):.2f}",
+    #            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    #y += 22
+    #cv2.putText(frame, f"hip_amp={det.get('amp', float('nan')):.1f}  sho_amp={det.get('shoulder_amp', float('nan')):.1f}",
+    #            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    #y += 22
+    #cv2.putText(frame, f"{infer_ms:.1f} ms",
+    #            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
 # ---------------- MAIN ----------------
 def main():
@@ -548,8 +547,8 @@ def main():
     detector = JumpDetector(fps)
     sm = JumpRopeStateMachine()
 
-    out_video_path = "jump_rope_results/jump_rope_hip_airborne_shoulder_cycle.mp4"
-    out_csv_path = "jump_rope_results/jump_rope_hip_airborne_shoulder_cycle.csv"
+    out_video_path = f"jump_rope_results/jump_rope_newest_{VIDEO_SOURCE.split('/')[-1].split('_')[0]}.mp4"
+    out_csv_path = f"jump_rope_results/jump_rope_newest_{VIDEO_SOURCE.split('/')[-1].split('_')[0]}.csv"
     writer = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     frame_data = []
