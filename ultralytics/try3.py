@@ -227,7 +227,7 @@ class JumpDetector:
         self.jump_times.clear()
         self.shoulder_interval_hist.clear()
         self.shoulder_expected_interval = None
-
+    # notice sigma here, how noisy the hip-y (or shoulder-y) values are when the person is on the ground.
     @staticmethod
     def _robust_sigma(vals: np.ndarray) -> float:
         if vals.size == 0:
@@ -318,19 +318,18 @@ class JumpDetector:
             "amp": float("nan"),
             "min_air_y": float("nan"),
         }
-
+        ## do we need this check here???
         if not (lhip and rhip and lank and rank and lsho and rsho) or person_h <= 1.0:
             return out
 
         ankle_dist_th = 25
         amp_th = max(AMP_MIN_PX, AMP_FRAC * person_h)  # amplitude gate threshold
 
-        # filtered keypoints
+        # filtered keypoints, uses kalman filter! 
         lh = self.kf_lhip.update(*lhip)
         rh = self.kf_rhip.update(*rhip)
         la = self.kf_lank.update(*lank)
         ra = self.kf_rank.update(*rank)
-
         ls = self.kf_lsho.update(*lsho)
         rs = self.kf_rsho.update(*rsho)
 
@@ -354,7 +353,7 @@ class JumpDetector:
         if len(self.hip_y_hist) < 10:
             return out
 
-        # HIP ground & noise (for airborne + dynamic lift)
+        # HIP ground & noise , here we take lower(how px in cv) as ground_y
         ground_y = float(np.percentile(np.array(self.hip_y_hist, dtype=np.float32), 90.0))
         out["ground_y"] = ground_y
 
@@ -455,7 +454,7 @@ class JumpDetector:
                         )
                     out["expected_dt"] = float(self.shoulder_expected_interval)
 
-                # update amp EWMA (still used for dynamic hip lift threshold)
+                # update amp EWMA (still used for dynamic hip lift threshold), a smooth running average that remembers recent values more than old ones.
                 if self.amp_ewma is None:
                     self.amp_ewma = float(hip_amp)
                 else:
