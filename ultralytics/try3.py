@@ -10,7 +10,7 @@ import pandas as pd
 from openvino.runtime import Core
 # ---------------- CONFIG ----------------
 MODEL_PATH = "yolo26n-pose.static_int8.onnx"
-VIDEO_SOURCE = "TestVideos/sport13_25fps.mp4"
+VIDEO_SOURCE = "TestVideos/sport12_25fps.mp4"
 IMG_SIZE = 640
 
 DET_THRESH = 0.3
@@ -29,7 +29,7 @@ RIGHT_ANKLE = 16
 GROUND_HISTORY_SECONDS = 1.5
 AIRBORNE_CONFIRM_FRAMES = 1
 GROUND_CONFIRM_FRAMES = 1
-REFRACTORY_FRAMES = 7
+REFRACTORY_FRAMES = 9
 STOP_SUDDEN_SEC = 1.5
 
 # ---------------- CYCLE CHECKS (IMPROVED) ----------------
