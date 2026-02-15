@@ -198,7 +198,6 @@ class JumpDetector:
 
         self.hip_y_hist = deque(maxlen=max(10, int(self.fps * GROUND_HISTORY_SECONDS)))
         self.shoulder_y_hist = deque(maxlen=max(10, int(self.fps * GROUND_HISTORY_SECONDS)))
-        self.ankle_dist_hist = deque(maxlen=10)
 
         self.airborne_frames = 0
         self.ground_frames = 0
@@ -209,8 +208,6 @@ class JumpDetector:
         self.air_min_shoulder_y: Optional[float] = None
 
         self.jump_count = 0
-        self.single_count = 0
-        self.double_count = 0
         self.last_count_frame = -10_000
 
         # for SPM display
@@ -295,25 +292,19 @@ class JumpDetector:
             "is_airborne": False,
             "jump_type": "unknown",
             "jump_count": self.jump_count,
-            "single_count": self.single_count,
-            "double_count": self.double_count,
             "spm": 0.0,
             "ground_y": float("nan"),
             "lift_th": float("nan"),
             "lift_noise_sigma": float("nan"),
             "amp_ewma": float("nan"),
-            "ankle_distance": 0.0,
             "hip_y": float("nan"),
-
             # shoulder diagnostics
             "shoulder_y": float("nan"),
             "shoulder_ground_y": float("nan"),
             "shoulder_amp": float("nan"),
-
             "cycle_ok": False,
             "dt": float("nan"),
             "expected_dt": float("nan"),
-
             # hip segment amp (kept for debugging)
             "amp": float("nan"),
             "min_air_y": float("nan"),
@@ -322,7 +313,6 @@ class JumpDetector:
         if not (lhip and rhip and lank and rank and lsho and rsho) or person_h <= 1.0:
             return out
 
-        ankle_dist_th = 25
         amp_th = max(AMP_MIN_PX, AMP_FRAC * person_h)  # amplitude gate threshold
 
         # filtered keypoints, uses kalman filter! 
@@ -335,20 +325,12 @@ class JumpDetector:
 
         hip_y = float((lh[1] + rh[1]) / 2.0)
         shoulder_y = float((ls[1] + rs[1]) / 2.0)
-        ankle_dist = float(np.hypot(la[0] - ra[0], la[1] - ra[1]))
 
         out["hip_y"] = hip_y
         out["shoulder_y"] = shoulder_y
-        out["ankle_distance"] = ankle_dist
 
         self.hip_y_hist.append(hip_y)
         self.shoulder_y_hist.append(shoulder_y)
-        self.ankle_dist_hist.append(ankle_dist)
-
-        # classify single/double by ankle distance heuristic
-        if len(self.ankle_dist_hist) >= 5:
-            avg_dist = float(np.mean(list(self.ankle_dist_hist)[-5:]))
-            out["jump_type"] = "single" if avg_dist >= ankle_dist_th else "double"
 
         if len(self.hip_y_hist) < 10:
             return out
@@ -461,16 +443,8 @@ class JumpDetector:
                     self.amp_ewma = float((1.0 - AMP_EWMA_ALPHA) * self.amp_ewma + AMP_EWMA_ALPHA * hip_amp)
                 out["amp_ewma"] = float(self.amp_ewma)
 
-                # update type counters
-                if out["jump_type"] == "single":
-                    self.single_count += 1
-                else:
-                    self.double_count += 1
-
         out["is_airborne"] = self.is_airborne
         out["jump_count"] = self.jump_count
-        out["single_count"] = self.single_count
-        out["double_count"] = self.double_count
         if self.shoulder_expected_interval is not None:
             out["expected_dt"] = float(self.shoulder_expected_interval)
 
@@ -506,7 +480,7 @@ def draw_hud(frame: np.ndarray, det: Dict[str, Any], state: JumpRopeState, infer
     c = (160, 160, 160) if state == JumpRopeState.IDLE else (0, 255, 0) if state == JumpRopeState.JUMPING else (0, 165, 255)
 
     y = 30
-    cv2.putText(frame, f"Jump: {det['jump_count']} (S:{det['single_count']} D:{det['double_count']})",
+    cv2.putText(frame, f"Jump: {det['jump_count']}",
                 (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
     y += 26
     cv2.putText(frame, f"State: {state.value}  Type: {det['jump_type']}  SPM: {det['spm']:.1f}",
@@ -616,33 +590,23 @@ def main():
             "timestamp": t_sec,
             "best_conf": best_conf,
             "infer_ms": infer_ms,
-
             "jump_count": det["jump_count"],
-            "single_count": det["single_count"],
-            "double_count": det["double_count"],
             "jump_type": det["jump_type"],
             "spm": det["spm"],
             "state": sm.state.value,
-
             "cycle_ok": bool(det.get("cycle_ok", False)),
             "dt": det.get("dt", float("nan")),
             "expected_dt": det.get("expected_dt", float("nan")),
-
             # amplitudes
             "hip_amp": det.get("amp", float("nan")),
             "shoulder_amp": det.get("shoulder_amp", float("nan")),
             "amp_ewma": det.get("amp_ewma", float("nan")),
-
             "lift_th": det.get("lift_th", float("nan")),
             "lift_noise_sigma": det.get("lift_noise_sigma", float("nan")),
-
             "ground_y": det.get("ground_y", float("nan")),
             "hip_y": det.get("hip_y", float("nan")),
-
             "shoulder_ground_y": det.get("shoulder_ground_y", float("nan")),
             "shoulder_y": det.get("shoulder_y", float("nan")),
-
-            "ankle_distance": det.get("ankle_distance", 0.0),
             "is_airborne": det.get("is_airborne", False),
         })
 
