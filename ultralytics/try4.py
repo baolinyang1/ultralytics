@@ -8,13 +8,14 @@ import cv2
 import numpy as np
 import pandas as pd
 from openvino.runtime import Core
+
 # ---------------- CONFIG ----------------
-MODEL_PATH = "yolo26n-pose.static_int8.onnx"
-VIDEO_SOURCE = "TestVideos/107.2.mp4"
+MODEL_PATH = "model_int8.onnx"
+VIDEO_SOURCE = "TestVideos/107.1.mp4"
 IMG_SIZE = 640
 
-DET_THRESH = 0.3
-MIN_KPT_CONF = 0.25
+DET_THRESH = 0.5
+MIN_KPT_CONF = 0.0
 
 # COCO-17 indices
 LEFT_SHOULDER = 5
@@ -74,6 +75,7 @@ class JumpRopeState(Enum):
     JUMPING = "JUMPING"
     STOPPED = "STOPPED"
 
+
 # ---------------- KALMAN FILTER ----------------
 class KalmanFilter2D:
     """Constant velocity KF: state=[x,y,vx,vy], measurement=[x,y]."""
@@ -113,56 +115,63 @@ class KalmanFilter2D:
         self.cov = (np.eye(4, dtype=np.float32) - K @ self.H) @ self.cov
         return self.state[:2].copy()
 
-# ---------------- UTILS ----------------
+
+# ---------------- UTILS (NEW MODEL: normalized outputs) ----------------
 def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
     img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
     img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))[None, ...]
+    img = np.transpose(img, (2, 0, 1))[None, ...]  # NCHW
     return img
 
-def decode_bbox_xyxy_modelpx(det57: np.ndarray) -> Tuple[float, float, float, float, float]:
+def decode_bbox_xyxy_norm(det57: np.ndarray) -> Tuple[float, float, float, float, float]:
+    """
+    New model: bbox is normalized to full frame: x1,y1,x2,y2 in [0..1] (usually).
+    """
     x1, y1, x2, y2, score = det57[:5]
     x1, x2 = (x1, x2) if x1 <= x2 else (x2, x1)
     y1, y2 = (y1, y2) if y1 <= y2 else (y2, y1)
     return float(x1), float(y1), float(x2), float(y2), float(score)
 
 def decode_kpts_17x3(det57: np.ndarray) -> np.ndarray:
+    """
+    det length 57: [0..3]=bbox, [4]=conf, [5]=cls, [6..56]=51 kpt vals
+    kpts are normalized to full frame (0..1), conf is at [:,2]
+    """
     return det57[6:6 + 51].reshape(17, 3).astype(np.float32)
 
-def map_modelpx_to_frame(xy_model: np.ndarray, w: int, h: int) -> np.ndarray:
-    out = xy_model.astype(np.float32).copy()
-    out[:, 0] *= (w / float(IMG_SIZE))
-    out[:, 1] *= (h / float(IMG_SIZE))
+def map_norm_to_frame_xy(xy_norm: np.ndarray, w: int, h: int) -> np.ndarray:
+    out = xy_norm.astype(np.float32).copy()
+    out[:, 0] *= float(w)
+    out[:, 1] *= float(h)
     return out
 
 def bbox_height_px(det57: np.ndarray, w: int, h: int) -> float:
-    x1m, y1m, x2m, y2m, _ = decode_bbox_xyxy_modelpx(det57)
-    return float(abs(y2m - y1m) * (h / float(IMG_SIZE)))
+    x1n, y1n, x2n, y2n, _ = decode_bbox_xyxy_norm(det57)
+    return float(abs(y2n - y1n) * h)
 
-def bbox_center_modelpx(det57: np.ndarray) -> Tuple[float, float]:
-    x1m, y1m, x2m, y2m, _ = decode_bbox_xyxy_modelpx(det57)
-    return float((x1m + x2m) / 2.0), float((y1m + y2m) / 2.0)
+def bbox_center_px(det57: np.ndarray, w: int, h: int) -> Tuple[float, float]:
+    x1n, y1n, x2n, y2n, _ = decode_bbox_xyxy_norm(det57)
+    cxn = (x1n + x2n) / 2.0
+    cyn = (y1n + y2n) / 2.0
+    return float(cxn * w), float(cyn * h)
 
 def get_kpt_xy(det57: np.ndarray, idx: int, w: int, h: int) -> Optional[Tuple[float, float]]:
-    kpts = decode_kpts_17x3(det57)
+    kpts = decode_kpts_17x3(det57)  # normalized
     if float(kpts[idx, 2]) < MIN_KPT_CONF:
         return None
-    xy = map_modelpx_to_frame(kpts[:, :2], w, h)
+    xy = map_norm_to_frame_xy(kpts[:, :2], w, h)
     return float(xy[idx, 0]), float(xy[idx, 1])
 
 def draw_pose(frame: np.ndarray, det57: np.ndarray):
     h, w = frame.shape[:2]
-    x1m, y1m, x2m, y2m, conf = decode_bbox_xyxy_modelpx(det57)
-    sx, sy = w / float(IMG_SIZE), h / float(IMG_SIZE)
-    x1, y1, x2, y2 = int(x1m * sx), int(y1m * sy), int(x2m * sx), int(y2m * sy)
+    x1n, y1n, x2n, y2n, conf = decode_bbox_xyxy_norm(det57)
+    x1, y1, x2, y2 = int(x1n * w), int(y1n * h), int(x2n * w), int(y2n * h)
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    #cv2.putText(frame, f"{conf:.2f}", (x1, max(0, y1 - 6)),
-    #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     kpts = decode_kpts_17x3(det57)
-    xy = map_modelpx_to_frame(kpts[:, :2], w, h)
+    xy = map_norm_to_frame_xy(kpts[:, :2], w, h)
     kc = kpts[:, 2]
 
     pts = [(int(xy[i, 0]), int(xy[i, 1])) for i in range(17)]
@@ -173,6 +182,7 @@ def draw_pose(frame: np.ndarray, det57: np.ndarray):
     for a, b in SKELETON:
         if float(kc[a]) >= MIN_KPT_CONF and float(kc[b]) >= MIN_KPT_CONF:
             cv2.line(frame, pts[a], pts[b], (255, 0, 0), 2)
+
 
 # ---------------- JUMP DETECTOR (HIP AIRBORNE, SHOULDER CYCLE CHECK) ----------------
 class JumpDetector:
@@ -203,14 +213,12 @@ class JumpDetector:
         self.ground_frames = 0
         self.is_airborne = False
 
-        # min positions during airborne segment
         self.air_min_y: Optional[float] = None
         self.air_min_shoulder_y: Optional[float] = None
 
         self.jump_count = 0
         self.last_count_frame = -10_000
 
-        # for SPM display
         self.jump_times = deque(maxlen=50)
 
         # cadence (SHOULDER-based)
@@ -224,7 +232,7 @@ class JumpDetector:
         self.jump_times.clear()
         self.shoulder_interval_hist.clear()
         self.shoulder_expected_interval = None
-    # notice sigma here, how noisy the hip-y (or shoulder-y) values are when the person is on the ground.
+
     @staticmethod
     def _robust_sigma(vals: np.ndarray) -> float:
         if vals.size == 0:
@@ -259,7 +267,6 @@ class JumpDetector:
         lift_th = min(lift_th, HIP_LIFT_MAX_FRAC * person_h)
         return float(lift_th)
 
-    # ---- SHOULDER-based cycle vote ----
     def _cycle_vote_ok(self, dt: float) -> bool:
         tmp = list(self.shoulder_interval_hist) + [float(dt)]
         if len(tmp) < CYCLE_WINDOW:
@@ -298,24 +305,21 @@ class JumpDetector:
             "lift_noise_sigma": float("nan"),
             "amp_ewma": float("nan"),
             "hip_y": float("nan"),
-            # shoulder diagnostics
             "shoulder_y": float("nan"),
             "shoulder_ground_y": float("nan"),
             "shoulder_amp": float("nan"),
             "cycle_ok": False,
             "dt": float("nan"),
             "expected_dt": float("nan"),
-            # hip segment amp (kept for debugging)
             "amp": float("nan"),
             "min_air_y": float("nan"),
         }
-        ## do we need this check here???
+
         if not (lhip and rhip and lank and rank and lsho and rsho) or person_h <= 1.0:
             return out
 
-        amp_th = max(AMP_MIN_PX, AMP_FRAC * person_h)  # amplitude gate threshold
+        amp_th = max(AMP_MIN_PX, AMP_FRAC * person_h)
 
-        # filtered keypoints, uses kalman filter! 
         lh = self.kf_lhip.update(*lhip)
         rh = self.kf_rhip.update(*rhip)
         la = self.kf_lank.update(*lank)
@@ -335,7 +339,6 @@ class JumpDetector:
         if len(self.hip_y_hist) < 10:
             return out
 
-        # HIP ground & noise , here we take lower(how px in cv) as ground_y
         ground_y = float(np.percentile(np.array(self.hip_y_hist, dtype=np.float32), 90.0))
         out["ground_y"] = ground_y
 
@@ -345,14 +348,12 @@ class JumpDetector:
         out["lift_th"] = float(lift_th)
         out["amp_ewma"] = float(self.amp_ewma) if self.amp_ewma is not None else float("nan")
 
-        # SHOULDER "ground" for amplitude gate
         if len(self.shoulder_y_hist) >= 10:
             shoulder_ground_y = float(np.percentile(np.array(self.shoulder_y_hist, dtype=np.float32), 90.0))
         else:
             shoulder_ground_y = float("nan")
         out["shoulder_ground_y"] = shoulder_ground_y
 
-        # HIP-based airborne decision
         airborne_now = hip_y <= (ground_y - lift_th)
 
         if airborne_now:
@@ -362,28 +363,23 @@ class JumpDetector:
             self.ground_frames += 1
             self.airborne_frames = 0
 
-        # transition: ground -> airborne
         if (not self.is_airborne) and (self.airborne_frames >= AIRBORNE_CONFIRM_FRAMES):
             self.is_airborne = True
             self.air_min_y = hip_y
             self.air_min_shoulder_y = shoulder_y
 
-        # track min during airborne
         if self.is_airborne:
             self.air_min_y = hip_y if self.air_min_y is None else float(min(self.air_min_y, hip_y))
             self.air_min_shoulder_y = shoulder_y if self.air_min_shoulder_y is None else float(min(self.air_min_shoulder_y, shoulder_y))
 
-        # transition: airborne -> ground (landing event)
         if self.is_airborne and (self.ground_frames >= GROUND_CONFIRM_FRAMES):
             refractory_ok = (frame_idx - self.last_count_frame) >= REFRACTORY_FRAMES
 
-            # HIP amplitude (debug)
             min_air_y = self.air_min_y if self.air_min_y is not None else hip_y
             hip_amp = float(ground_y - float(min_air_y))
             out["amp"] = hip_amp
             out["min_air_y"] = float(min_air_y)
 
-            # SHOULDER amplitude (used for gate)
             min_air_sho = self.air_min_shoulder_y if self.air_min_shoulder_y is not None else shoulder_y
             if not np.isnan(shoulder_ground_y):
                 shoulder_amp = float(shoulder_ground_y - float(min_air_sho))
@@ -391,7 +387,6 @@ class JumpDetector:
                 shoulder_amp = float("nan")
             out["shoulder_amp"] = shoulder_amp
 
-            # reset airborne state
             self.is_airborne = False
             self.air_min_y = None
             self.air_min_shoulder_y = None
@@ -408,24 +403,18 @@ class JumpDetector:
                         self._reset_cadence()
                         return out
 
-                # SHOULDER amplitude gate (replaces hip amp gate)
                 if np.isnan(shoulder_amp) or shoulder_amp < amp_th:
                     return out
 
-                # SHOULDER-based cycle vote
                 cycle_ok = True
                 if dt is not None:
                     cycle_ok = self._cycle_vote_ok(dt)
                 out["cycle_ok"] = bool(cycle_ok)
-                # if not cycle_ok:
-                #     return out
 
-                # ACCEPT jump
                 self.jump_count += 1
                 self.last_count_frame = frame_idx
                 self.jump_times.append(float(t_sec))
 
-                # update SHOULDER cadence EWMA
                 if dt is not None:
                     self.shoulder_interval_hist.append(float(dt))
                     if self.shoulder_expected_interval is None:
@@ -436,7 +425,6 @@ class JumpDetector:
                         )
                     out["expected_dt"] = float(self.shoulder_expected_interval)
 
-                # update amp EWMA (still used for dynamic hip lift threshold), a smooth running average that remembers recent values more than old ones.
                 if self.amp_ewma is None:
                     self.amp_ewma = float(hip_amp)
                 else:
@@ -448,7 +436,6 @@ class JumpDetector:
         if self.shoulder_expected_interval is not None:
             out["expected_dt"] = float(self.shoulder_expected_interval)
 
-        # SPM estimate
         if len(self.jump_times) >= 2:
             intervals = np.diff(np.array(self.jump_times, dtype=np.float32))
             if intervals.size:
@@ -458,42 +445,32 @@ class JumpDetector:
 
         return out
 
-# ---------------- STATE MACHINE ----------------
-class JumpRopeState(Enum):
-    IDLE = "IDLE"
-    JUMPING = "JUMPING"
-    STOPPED = "STOPPED"
 
+# ---------------- STATE MACHINE ----------------
 class JumpRopeStateMachine:
     def __init__(self):
         self.state = JumpRopeState.IDLE
         self._last_seen_count = 0
         self.last_count_time: Optional[float] = None
-
-        # NEW: ensure we only subtract once per stop episode
         self._pending_restart_penalty = False
 
     def update(self, t_sec: float, jump_count: int) -> int:
-        # count increased => a landing/jump was detected
         if jump_count > self._last_seen_count:
-            # if we were stopped, cancel this first restart increment (once)
             if self.state == JumpRopeState.STOPPED and self._pending_restart_penalty:
-                jump_count = self._last_seen_count   # cancel the +1
-                self._pending_restart_penalty = False  # done for this stop
+                jump_count = self._last_seen_count
+                self._pending_restart_penalty = False
 
             self._last_seen_count = jump_count
             self.last_count_time = t_sec
             self.state = JumpRopeState.JUMPING
             return jump_count
 
-        # no last time yet
         if self.last_count_time is None:
             return jump_count
 
-        # detect stop
         if self.state == JumpRopeState.JUMPING and (t_sec - self.last_count_time) > STOP_SUDDEN_SEC:
             self.state = JumpRopeState.STOPPED
-            self._pending_restart_penalty = True  # next increment will be canceled
+            self._pending_restart_penalty = True
 
         return jump_count
 
@@ -507,18 +484,7 @@ def draw_hud(frame: np.ndarray, det: Dict[str, Any], state: JumpRopeState, infer
     y += 26
     cv2.putText(frame, f"State: {state.value}  Type: {det['jump_type']}  SPM: {det['spm']:.1f}",
                 (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
-    #y += 24
-    #cv2.putText(frame, f"hip lift={det.get('lift_th', float('nan')):.1f}  sigma={det.get('lift_noise_sigma', float('nan')):.2f}  ampEWMA={det.get('amp_ewma', float('nan')):.1f}",
-    #            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    #y += 22
-    #cv2.putText(frame, f"cycle_ok={bool(det.get('cycle_ok', False))} dt={det.get('dt', float('nan')):.2f} exp={det.get('expected_dt', float('nan')):.2f}",
-    #            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    #y += 22
-    #cv2.putText(frame, f"hip_amp={det.get('amp', float('nan')):.1f}  sho_amp={det.get('shoulder_amp', float('nan')):.1f}",
-    #            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    #y += 22
-    #cv2.putText(frame, f"{infer_ms:.1f} ms",
-    #            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
 
 # ---------------- MAIN ----------------
 def main():
@@ -542,14 +508,14 @@ def main():
     detector = JumpDetector(fps)
     sm = JumpRopeStateMachine()
 
-    out_video_path = f"jump_rope_results/jump_rope_newest_{VIDEO_SOURCE.split('/')[-1].split('_')[0]}.mp4"
-    out_csv_path = f"jump_rope_results/jump_rope_newest_{VIDEO_SOURCE.split('/')[-1].split('_')[0]}.csv"
+    out_video_path = f"jump_rope_results/jump_rope_newest_{os.path.basename(VIDEO_SOURCE).split('_')[0]}.mp4"
+    out_csv_path = f"jump_rope_results/jump_rope_newest_{os.path.basename(VIDEO_SOURCE).split('_')[0]}.csv"
     writer = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     frame_data = []
     frame_idx = 0
-    prev_center = None
-    prev_h = None
+    prev_center_px = None
+    prev_h_px = None
 
     while True:
         ok, frame = cap.read()
@@ -559,7 +525,7 @@ def main():
         t_sec = frame_idx / fps
 
         t0 = time.perf_counter()
-        preds = compiled([preprocess(frame)])[out_layer][0]
+        preds = compiled([preprocess(frame)])[out_layer][0]  # (N,57)
         infer_ms = (time.perf_counter() - t0) * 1000.0
 
         valid = preds[preds[:, 4] >= DET_THRESH]
@@ -567,16 +533,16 @@ def main():
             frame_idx += 1
             continue
 
-        # tracking: pick best match near previous bbox center
-        if prev_center is None:
+        # tracking: pick best match near previous bbox center (NOW in frame pixels)
+        if prev_center_px is None:
             best = valid[int(np.argmax(valid[:, 4]))]
         else:
-            centers = np.array([bbox_center_modelpx(d) for d in valid], dtype=np.float32)
-            dist2 = (centers[:, 0] - float(prev_center[0])) ** 2 + (centers[:, 1] - float(prev_center[1])) ** 2
+            centers_px = np.array([bbox_center_px(d, width, height) for d in valid], dtype=np.float32)
+            dist2 = (centers_px[:, 0] - float(prev_center_px[0])) ** 2 + (centers_px[:, 1] - float(prev_center_px[1])) ** 2
 
-            heights = np.array([bbox_height_px(d, width, height) for d in valid], dtype=np.float32)
-            if prev_h is not None and prev_h > 1.0:
-                mask = (heights >= 0.7 * prev_h) & (heights <= 1.3 * prev_h)
+            heights_px = np.array([bbox_height_px(d, width, height) for d in valid], dtype=np.float32)
+            if prev_h_px is not None and prev_h_px > 1.0:
+                mask = (heights_px >= 0.7 * prev_h_px) & (heights_px <= 1.3 * prev_h_px)
                 if np.any(mask):
                     idxs = np.where(mask)[0]
                     best = valid[idxs[int(np.argmin(dist2[idxs]))]]
@@ -585,15 +551,14 @@ def main():
             else:
                 best = valid[int(np.argmin(dist2))]
 
-        prev_center = bbox_center_modelpx(best)
-        prev_h = bbox_height_px(best, width, height)
+        prev_center_px = bbox_center_px(best, width, height)
+        prev_h_px = bbox_height_px(best, width, height)
         best_conf = float(best[4])
 
         draw_pose(frame, best)
 
         person_h = bbox_height_px(best, width, height)
 
-        # required keypoints
         lhip = get_kpt_xy(best, LEFT_HIP, width, height)
         rhip = get_kpt_xy(best, RIGHT_HIP, width, height)
         lank = get_kpt_xy(best, LEFT_ANKLE, width, height)
@@ -603,7 +568,7 @@ def main():
 
         det = detector.update(frame_idx, t_sec, lhip, rhip, lank, rank, lsho, rsho, person_h)
         det["jump_count"] = sm.update(t_sec, det["jump_count"])
-        detector.jump_count = det["jump_count"]  # keep detector consistent
+        detector.jump_count = det["jump_count"]
 
         draw_hud(frame, det, sm.state, infer_ms)
         writer.write(frame)
@@ -620,7 +585,6 @@ def main():
             "cycle_ok": bool(det.get("cycle_ok", False)),
             "dt": det.get("dt", float("nan")),
             "expected_dt": det.get("expected_dt", float("nan")),
-            # amplitudes
             "hip_amp": det.get("amp", float("nan")),
             "shoulder_amp": det.get("shoulder_amp", float("nan")),
             "amp_ewma": det.get("amp_ewma", float("nan")),
@@ -646,6 +610,7 @@ def main():
     print("Total count:", detector.jump_count)
     print("Output video:", out_video_path)
     print("Output csv:", out_csv_path)
+
 
 if __name__ == "__main__":
     main()
