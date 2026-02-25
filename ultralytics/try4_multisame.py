@@ -12,16 +12,16 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "model_int8.onnx"
-VIDEO_SOURCE = "TestVideos/1053.mp4"
+VIDEO_SOURCE = "TestVideos/1055.mp4"
 IMG_SIZE = 640
 
-DET_THRESH = 0.5
+# Lowering this helps prevent brief missed detections -> ID switches
+DET_THRESH = 0.35
 MIN_KPT_CONF = 0.0
 
 # COCO-17 indices
 LEFT_SHOULDER = 5
 RIGHT_SHOULDER = 6
-
 LEFT_HIP = 11
 RIGHT_HIP = 12
 LEFT_ANKLE = 15
@@ -66,6 +66,7 @@ SKELETON = [
     (7, 9), (8, 10), (5, 11), (6, 12), (11, 12),
     (11, 13), (12, 14), (13, 15), (14, 16)
 ]
+
 
 # ---------------- STATE ----------------
 class JumpRopeState(Enum):
@@ -114,7 +115,7 @@ class KalmanFilter2D:
         return self.state[:2].copy()
 
 
-# ---------------- UTILS (NEW MODEL: normalized outputs) ----------------
+# ---------------- UTILS (normalized outputs) ----------------
 def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
     img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
@@ -179,6 +180,39 @@ def iou_xyxy(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> floa
     area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
     union = area_a + area_b - inter
     return float(inter / union) if union > 0 else 0.0
+
+
+def nms_dets(dets: np.ndarray, w: int, h: int, iou_th: float = 0.45) -> np.ndarray:
+    """
+    NMS on det57 array using bbox IoU. Keeps highest-conf boxes.
+    This prevents duplicate detections of the same person from creating ID flips.
+    """
+    if dets.shape[0] <= 1:
+        return dets
+
+    boxes = np.array([bbox_xyxy_px(d, w, h) for d in dets], dtype=np.int32)
+    scores = dets[:, 4].astype(np.float32)
+
+    order = scores.argsort()[::-1]
+    keep = []
+
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+
+        rest = order[1:]
+        bi = tuple(boxes[i].tolist())
+
+        ious = np.empty((rest.size,), dtype=np.float32)
+        for k, j in enumerate(rest):
+            bj = tuple(boxes[int(j)].tolist())
+            ious[k] = iou_xyxy(bi, bj)
+
+        order = rest[ious < iou_th]
+
+    return dets[np.array(keep, dtype=np.int32)]
 
 
 def get_kpt_xy(det57: np.ndarray, idx: int, w: int, h: int) -> Optional[Tuple[float, float]]:
@@ -280,9 +314,7 @@ class JumpDetector:
         return float(lift_th)
 
     def update(self, frame_idx: int, t_sec: float,
-               lhip, rhip, lank, rank,
-               lsho, rsho,
-               person_h: float) -> Dict[str, Any]:
+               lhip, rhip, lank, rank, lsho, rsho, person_h: float) -> Dict[str, Any]:
 
         out = {
             "is_airborne": False,
@@ -465,27 +497,38 @@ class Track:
     last_bbox: Tuple[int, int, int, int]
     prev_center: Tuple[float, float]
     prev_h: float
-    color: Tuple[int, int, int]
+    color: Tuple[int, int, int]  # BGR
 
 
 class MultiPersonTracker:
+    """
+    ID stability improvements:
+    1) NMS removes duplicate detections per frame.
+    2) "Fallback reassociation": if a detection is unmatched, attach it to the nearest track
+       instead of instantly spawning a new ID (prevents ID switches after brief gate failures).
+    3) We never drop tracks (per your request).
+    """
+
     def __init__(
         self,
         fps: float,
-        iou_gate: float = 0.15,
-        center_gate_frac: float = 0.70,
-        height_gate: float = 0.40,
+        iou_gate: float = 0.10,
+        center_gate_frac: float = 0.90,
+        height_gate: float = 0.55,   # more tolerant
+        fallback_dist_frac: float = 1.20,
     ):
         self.fps = float(fps)
         self.iou_gate = float(iou_gate)
         self.center_gate_frac = float(center_gate_frac)
         self.height_gate = float(height_gate)
+        self.fallback_dist_frac = float(fallback_dist_frac)
 
         self._next_id = 1
         self.tracks: Dict[int, Track] = {}
 
     def _color_for(self, tid: int) -> Tuple[int, int, int]:
-        return (0, 255, 0)
+        # deterministic-ish colors (BGR)
+        return (int((tid * 73) % 255), int((tid * 151) % 255), int((tid * 211) % 255))
 
     def _new_track(self, frame_idx: int, det57: np.ndarray, w: int, h: int) -> Track:
         bb = bbox_xyxy_px(det57, w, h)
@@ -514,31 +557,39 @@ class MultiPersonTracker:
         if hh <= 2.0 or tr.prev_h <= 2.0:
             return None
 
+        # height similarity gate (tolerant)
         if not ((1.0 - self.height_gate) * tr.prev_h <= hh <= (1.0 + self.height_gate) * tr.prev_h):
             return None
 
+        # distance gate (tolerant)
         dx = float(cx - tr.prev_center[0])
         dy = float(cy - tr.prev_center[1])
         dist = (dx * dx + dy * dy) ** 0.5
         if dist > self.center_gate_frac * tr.prev_h:
             return None
 
+        # IoU gate (looser)
         iou = iou_xyxy(tr.last_bbox, bb)
         if iou < self.iou_gate:
             return None
 
+        # score = IoU - distance penalty
         dist_norm = dist / (tr.prev_h + 1e-6)
-        score = float(iou - 0.25 * dist_norm)
-        return score
+        return float(iou - 0.20 * dist_norm)
 
     def associate(self, frame_idx: int, dets: np.ndarray, w: int, h: int) -> Dict[int, int]:
+        """
+        Returns mapping {track_id: det_index}.
+        Greedy best-first on gated matches, then fallback-nearest for unmatched dets.
+        Spawns new ID only if truly far from all existing tracks.
+        """
         if dets.shape[0] == 0:
-            self._prune(frame_idx)
             return {}
 
         det_count = dets.shape[0]
         track_ids = list(self.tracks.keys())
 
+        # First pass: gated matching candidates
         candidates: List[Tuple[float, int, int]] = []
         for tid in track_ids:
             tr = self.tracks[tid]
@@ -553,6 +604,7 @@ class MultiPersonTracker:
         assigned_dets = set()
         assignment: Dict[int, int] = {}
 
+        # Greedy assign best pairs
         for s, tid, j in candidates:
             if tid in assigned_tracks or j in assigned_dets:
                 continue
@@ -560,20 +612,41 @@ class MultiPersonTracker:
             assigned_tracks.add(tid)
             assigned_dets.add(j)
 
-        # Spawn new tracks for unmatched detections
-        for j in range(det_count):
-            if j in assigned_dets:
-                continue
-            tr = self._new_track(frame_idx, dets[j], w, h)
-            self.tracks[tr.track_id] = tr
-            assignment[tr.track_id] = j
+        # Second pass: fallback reassociation (prevents ID switching)
+        unmatched = [j for j in range(det_count) if j not in assigned_dets]
+        for j in unmatched:
+            cx, cy = bbox_center_px(dets[j], w, h)
 
-        self._prune(frame_idx)
+            best_tid = None
+            best_dist = 1e18
+
+            for tid, tr in self.tracks.items():
+                if tid in assigned_tracks:
+                    continue
+                dx = float(cx - tr.prev_center[0])
+                dy = float(cy - tr.prev_center[1])
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_tid = tid
+
+            if best_tid is not None:
+                tr = self.tracks[best_tid]
+                gate = self.fallback_dist_frac * max(20.0, tr.prev_h)
+                if best_dist <= gate:
+                    assignment[best_tid] = j
+                    assigned_tracks.add(best_tid)
+                    assigned_dets.add(j)
+                    continue
+
+            # Truly new person -> new ID
+            tr_new = self._new_track(frame_idx, dets[j], w, h)
+            self.tracks[tr_new.track_id] = tr_new
+            assignment[tr_new.track_id] = j
+            assigned_tracks.add(tr_new.track_id)
+            assigned_dets.add(j)
+
         return assignment
-
-    def _prune(self, frame_idx: int):
-        # User request: never drop any track
-        return
 
 
 # ---------------- MAIN ----------------
@@ -597,13 +670,14 @@ def main():
 
     mp = MultiPersonTracker(
         fps=fps,
-        iou_gate=0.15,
-        center_gate_frac=0.70,
-        height_gate=0.40,
+        iou_gate=0.10,
+        center_gate_frac=0.90,
+        height_gate=0.55,
+        fallback_dist_frac=1.20,
     )
 
-    out_video_path = f"jump_rope_results/jump_rope_multiperson_{os.path.basename(VIDEO_SOURCE).split('_')[0]}.mp4"
-    out_csv_path = f"jump_rope_results/jump_rope_multiperson_{os.path.basename(VIDEO_SOURCE).split('_')[0]}.csv"
+    out_video_path = f"jump_rope_results/jump_rope_multiperson_stable_{os.path.basename(VIDEO_SOURCE).split('_')[0]}.mp4"
+    out_csv_path = f"jump_rope_results/jump_rope_multiperson_stable_{os.path.basename(VIDEO_SOURCE).split('_')[0]}.csv"
     writer = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     frame_data = []
@@ -617,7 +691,7 @@ def main():
         t_sec = frame_idx / fps
 
         t0 = time.perf_counter()
-        preds = compiled([preprocess(frame)])[out_layer][0]
+        preds = compiled([preprocess(frame)])[out_layer][0]  # (N,57)
         infer_ms = (time.perf_counter() - t0) * 1000.0
 
         valid = preds[preds[:, 4] >= DET_THRESH]
@@ -625,6 +699,9 @@ def main():
             writer.write(frame)
             frame_idx += 1
             continue
+
+        # IMPORTANT: remove duplicate boxes per person
+        valid = nms_dets(valid, width, height, iou_th=0.45)
 
         assign = mp.associate(frame_idx, valid, width, height)
 
@@ -659,7 +736,7 @@ def main():
             label = f"ID {tid} | Jump {det['jump_count']} | {tr.sm.state.value} | SPM {det['spm']:.1f}"
             cv2.putText(
                 frame, label, (x1, max(18, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, tr.color, 6
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, tr.color, 3
             )
 
             frame_data.append({
@@ -697,13 +774,13 @@ def main():
 
     pd.DataFrame(frame_data).to_csv(out_csv_path, index=False, encoding="utf-8-sig")
 
+    # Top 4 final counts
     print("DONE")
     if len(mp.tracks) == 0:
         print("No tracks were created.")
     else:
         all_counts = [(tid, tr.detector.jump_count) for tid, tr in mp.tracks.items()]
         all_counts.sort(key=lambda x: x[1], reverse=True)
-
         top_k = all_counts[:4]
         print("Top 4 jump counts:")
         for rank, (tid, cnt) in enumerate(top_k, start=1):
