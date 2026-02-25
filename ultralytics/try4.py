@@ -11,7 +11,7 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "model_int8.onnx"
-VIDEO_SOURCE = "TestVideos/107.1.mp4"
+VIDEO_SOURCE = "TestVideos/107.2.mp4"
 IMG_SIZE = 640
 
 DET_THRESH = 0.5
@@ -297,7 +297,6 @@ class JumpDetector:
 
         out = {
             "is_airborne": False,
-            "jump_type": "unknown",
             "jump_count": self.jump_count,
             "spm": 0.0,
             "ground_y": float("nan"),
@@ -482,7 +481,7 @@ def draw_hud(frame: np.ndarray, det: Dict[str, Any], state: JumpRopeState, infer
     cv2.putText(frame, f"Jump: {det['jump_count']}",
                 (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
     y += 26
-    cv2.putText(frame, f"State: {state.value}  Type: {det['jump_type']}  SPM: {det['spm']:.1f}",
+    cv2.putText(frame, f"State: {state.value}  SPM: {det['spm']:.1f}",
                 (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
 
 
@@ -579,7 +578,6 @@ def main():
             "best_conf": best_conf,
             "infer_ms": infer_ms,
             "jump_count": det["jump_count"],
-            "jump_type": det["jump_type"],
             "spm": det["spm"],
             "state": sm.state.value,
             "cycle_ok": bool(det.get("cycle_ok", False)),
