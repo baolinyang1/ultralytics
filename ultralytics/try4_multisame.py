@@ -12,7 +12,7 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "model_int8.onnx"
-VIDEO_SOURCE = "TestVideos/1055.mp4"
+VIDEO_SOURCE = "TestVideos/1054.mp4"
 IMG_SIZE = 640
 
 # Lowering this helps prevent brief missed detections -> ID switches
@@ -31,7 +31,7 @@ RIGHT_ANKLE = 16
 GROUND_HISTORY_SECONDS = 1.5
 AIRBORNE_CONFIRM_FRAMES = 1
 GROUND_CONFIRM_FRAMES = 1
-REFRACTORY_FRAMES = 10
+REFRACTORY_FRAMES = 9
 STOP_SUDDEN_SEC = 1.5
 
 # ---------------- CYCLE CHECKS (IMPROVED) ----------------
