@@ -12,11 +12,10 @@ from openvino.runtime import Core
 
 # ---------------- CONFIG ----------------
 MODEL_PATH = "model_int8.onnx"
-VIDEO_SOURCE = "TestVideos/1054.mp4"
+VIDEO_SOURCE = "TestVideos/1053.mp4"
 IMG_SIZE = 640
 
-# Lowering this helps prevent brief missed detections -> ID switches
-DET_THRESH = 0.35
+DET_THRESH = 0.5
 MIN_KPT_CONF = 0.0
 
 # COCO-17 indices
@@ -32,16 +31,14 @@ GROUND_HISTORY_SECONDS = 1.5
 AIRBORNE_CONFIRM_FRAMES = 1
 GROUND_CONFIRM_FRAMES = 1
 REFRACTORY_FRAMES = 9
-STOP_SUDDEN_SEC = 1.5
+STOP_SUDDEN_SEC = 1.2
 
 # ---------------- CYCLE CHECKS (IMPROVED) ----------------
-MIN_JUMP_INTERVAL_SEC = 0.23
-MAX_JUMP_INTERVAL_SEC = 1.70
+MIN_JUMP_INTERVAL_SEC = 0.30
+MAX_JUMP_INTERVAL_SEC = 1.60
 
 # cadence tracking (adaptive)
 EWMA_ALPHA = 0.22
-MAD_K = 3.0
-MIN_MAD_SEC = 0.03
 
 # amplitude gate (stop/walk suppression)
 AMP_FRAC = 0.020
@@ -189,7 +186,7 @@ def nms_dets(dets: np.ndarray, w: int, h: int, iou_th: float = 0.45) -> np.ndarr
     """
     if dets.shape[0] <= 1:
         return dets
-
+    # notice here dets is each detection, each detection is dets57! EACH Box will be [x1,x2,y1,y2]
     boxes = np.array([bbox_xyxy_px(d, w, h) for d in dets], dtype=np.int32)
     scores = dets[:, 4].astype(np.float32)
 
@@ -693,16 +690,16 @@ def main():
         t0 = time.perf_counter()
         preds = compiled([preprocess(frame)])[out_layer][0]  # (N,57)
         infer_ms = (time.perf_counter() - t0) * 1000.0
-
+        #valid are a array of det57 that are above threshold, then it will be passed to nums_dets!!!
         valid = preds[preds[:, 4] >= DET_THRESH]
         if valid.shape[0] == 0:
             writer.write(frame)
             frame_idx += 1
             continue
 
-        # IMPORTANT: remove duplicate boxes per person
-        valid = nms_dets(valid, width, height, iou_th=0.45)
-
+        # IMPORTANT: remove duplicate boxes per person, changed for 0.45 to 0.6
+        valid = nms_dets(valid, width, height, iou_th=0.6)
+        # does the asisgning work here!
         assign = mp.associate(frame_idx, valid, width, height)
 
         for tid, det_idx in assign.items():
@@ -736,7 +733,7 @@ def main():
             label = f"ID {tid} | Jump {det['jump_count']} | {tr.sm.state.value} | SPM {det['spm']:.1f}"
             cv2.putText(
                 frame, label, (x1, max(18, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, tr.color, 3
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, tr.color, 7
             )
 
             frame_data.append({
