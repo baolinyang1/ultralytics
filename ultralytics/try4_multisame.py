@@ -1,7 +1,7 @@
 import os
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -33,8 +33,7 @@ GROUND_CONFIRM_FRAMES = 1
 REFRACTORY_FRAMES = 9
 STOP_SUDDEN_SEC = 1.2
 
-# ---------------- CYCLE CHECKS (ADDED: vote check) ----------------
-# hard dt bounds
+# ---------------- CYCLE CHECKS ----------------
 MIN_JUMP_INTERVAL_SEC = 0.23
 MAX_JUMP_INTERVAL_SEC = 1.60
 
@@ -57,17 +56,20 @@ AMP_EWMA_ALPHA = 0.25
 HIP_LIFT_MAX_FRAC = 0.085
 HIP_NOISE_BAND_FRAC = 0.18
 
-# ---------------- SHOULDER AMP: DYNAMIC GATE (NEW) ----------------
-# The old code used: shoulder_amp < amp_th (amp_th from person_h only).
-# Now: shoulder_amp_th adapts using:
-#   - base floor from person height (AMP_FRAC * person_h, AMP_MIN_PX)
-#   - shoulder amplitude EWMA (tracks typical shoulder jump amplitude)
-#   - shoulder ground noise sigma (robust MAD near ground)
+# ---------------- SHOULDER AMP: DYNAMIC GATE ----------------
 SHO_AMP_EWMA_ALPHA = 0.35
-SHO_AMP_TO_GATE = 0.50          # fraction of typical shoulder amp used as gate
-SHO_AMP_NOISE_K = 3.0           # require amp to exceed noise by this factor
-SHO_AMP_MAX_FRAC = 0.060        # cap threshold (fraction of person_h)
-SHO_NOISE_BAND_FRAC = 0.25      # same idea as hip, but for shoulders
+SHO_AMP_TO_GATE = 0.50
+SHO_AMP_NOISE_K = 3.0
+SHO_AMP_MAX_FRAC = 0.060
+SHO_NOISE_BAND_FRAC = 0.25
+
+# ---------------- MISS-COUNT FIX (NEW) ----------------
+# If current dt ≈ 2 * previous cadence average, assume 1 missed jump.
+# Then: add +1 extra to count (so this event adds 2 total).
+# We only apply when we have a stable expected_dt and dt isn't "too big".
+MISS_2X_LOW = 1.70     # dt must be >= 1.70 * expected_dt
+MISS_2X_HIGH = 2.30    # dt must be <= 2.30 * expected_dt
+MISS_MIN_HISTORY = 3   # need at least 3 intervals before trusting expected_dt
 
 # Skeleton (drawing only)
 SKELETON = [
@@ -76,6 +78,7 @@ SKELETON = [
     (7, 9), (8, 10), (5, 11), (6, 12), (11, 12),
     (11, 13), (12, 14), (13, 15), (14, 16)
 ]
+
 
 # ---------------- STATE ----------------
 class JumpRopeState(Enum):
@@ -124,7 +127,7 @@ class KalmanFilter2D:
         return self.state[:2].copy()
 
 
-# ---------------- UTILS (normalized outputs) ----------------
+# ---------------- UTILS ----------------
 def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
     img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
@@ -192,10 +195,6 @@ def iou_xyxy(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> floa
 
 
 def nms_dets(dets: np.ndarray, w: int, h: int, iou_th: float = 0.45) -> np.ndarray:
-    """
-    NMS on det57 array using bbox IoU. Keeps highest-conf boxes.
-    This prevents duplicate detections of the same person from creating ID flips.
-    """
     if dets.shape[0] <= 1:
         return dets
 
@@ -282,7 +281,7 @@ class JumpDetector:
         self.cycle_expected_interval: Optional[float] = None
 
         self.amp_ewma: Optional[float] = None
-        self.shoulder_amp_ewma: Optional[float] = None  # NEW
+        self.shoulder_amp_ewma: Optional[float] = None
 
     def _reset_cadence(self):
         self.jump_times.clear()
@@ -324,21 +323,22 @@ class JumpDetector:
         return float(lift_th)
 
     def _dynamic_shoulder_amp_th(self, person_h: float, shoulder_sigma: float) -> float:
-        # base "stop/walk" floor (height-normalized)
         base = max(AMP_MIN_PX, AMP_FRAC * person_h)
-
-        # adapt to this person's typical shoulder amplitude (if available)
-        if self.shoulder_amp_ewma is None:
-            from_ewma = 0.0
-        else:
-            from_ewma = SHO_AMP_TO_GATE * float(self.shoulder_amp_ewma)
-
-        # noise-aware gate (reject tiny bumps)
+        from_ewma = 0.0 if self.shoulder_amp_ewma is None else SHO_AMP_TO_GATE * float(self.shoulder_amp_ewma)
         from_noise = SHO_AMP_NOISE_K * float(shoulder_sigma)
-
         th = max(base, from_ewma, from_noise)
         th = min(th, SHO_AMP_MAX_FRAC * person_h)
         return float(th)
+
+    def _cadence_update_with_dt(self, dt: float) -> None:
+        """Update cadence EWMA and history with one dt sample."""
+        self.cycle_interval_hist.append(float(dt))
+        if self.cycle_expected_interval is None:
+            self.cycle_expected_interval = float(dt)
+        else:
+            self.cycle_expected_interval = float(
+                (1.0 - EWMA_ALPHA) * self.cycle_expected_interval + EWMA_ALPHA * float(dt)
+            )
 
     def update(self, frame_idx: int, t_sec: float,
                lhip, rhip, lank, rank, lsho, rsho, person_h: float) -> Dict[str, Any]:
@@ -355,13 +355,16 @@ class JumpDetector:
             "shoulder_y": float("nan"),
             "shoulder_ground_y": float("nan"),
             "shoulder_amp": float("nan"),
-            "shoulder_amp_th": float("nan"),          # NEW
-            "shoulder_noise_sigma": float("nan"),     # NEW
-            "shoulder_amp_ewma": float("nan"),        # NEW
+            "shoulder_amp_th": float("nan"),
+            "shoulder_noise_sigma": float("nan"),
+            "shoulder_amp_ewma": float("nan"),
             "dt": float("nan"),
             "expected_dt": float("nan"),
             "amp": float("nan"),
             "min_air_y": float("nan"),
+            # miss-count debug
+            "miss_fix_applied": False,
+            "added_extra_count": 0,
         }
 
         if not (lhip and rhip and lank and rank and lsho and rsho) or person_h <= 1.0:
@@ -386,7 +389,7 @@ class JumpDetector:
         if len(self.hip_y_hist) < 10:
             return out
 
-        # --- HIP ground + lift threshold (unchanged) ---
+        # --- HIP ground + lift threshold ---
         ground_y = float(np.percentile(np.array(self.hip_y_hist, dtype=np.float32), 90.0))
         out["ground_y"] = ground_y
 
@@ -396,7 +399,7 @@ class JumpDetector:
         out["lift_th"] = float(lift_th)
         out["amp_ewma"] = float(self.amp_ewma) if self.amp_ewma is not None else float("nan")
 
-        # --- SHOULDER ground + dynamic shoulder amp threshold (NEW) ---
+        # --- SHOULDER ground + dynamic amp threshold ---
         if len(self.shoulder_y_hist) >= 10:
             shoulder_ground_y = float(np.percentile(np.array(self.shoulder_y_hist, dtype=np.float32), 90.0))
             sho_sigma = self._estimate_ground_noise_sigma(self.shoulder_y_hist, shoulder_ground_y, SHO_NOISE_BAND_FRAC)
@@ -411,6 +414,7 @@ class JumpDetector:
         out["shoulder_amp_th"] = float(shoulder_amp_th)
         out["shoulder_amp_ewma"] = float(self.shoulder_amp_ewma) if self.shoulder_amp_ewma is not None else float("nan")
 
+        # airborne decision based on HIP
         airborne_now = hip_y <= (ground_y - lift_th)
 
         if airborne_now:
@@ -444,14 +448,17 @@ class JumpDetector:
                 shoulder_amp = float("nan")
             out["shoulder_amp"] = shoulder_amp
 
+            # reset airborne flags
             self.is_airborne = False
             self.air_min_y = None
             self.air_min_shoulder_y = None
 
             if refractory_ok:
                 dt = None
+                prev_t = None
                 if len(self.jump_times) >= 1:
-                    dt = float(t_sec - float(self.jump_times[-1]))
+                    prev_t = float(self.jump_times[-1])
+                    dt = float(t_sec - prev_t)
                     out["dt"] = dt
 
                     if dt < MIN_JUMP_INTERVAL_SEC:
@@ -460,8 +467,7 @@ class JumpDetector:
                         self._reset_cadence()
                         return out
 
-                # ---------------- DYNAMIC SHOULDER AMP GATE (UPDATED) ----------------
-                # If shoulder_amp is nan (rare), fall back to hip_amp gate using the base floor.
+                # shoulder gate
                 if np.isnan(shoulder_amp):
                     base_fallback = max(AMP_MIN_PX, AMP_FRAC * person_h)
                     if hip_amp < base_fallback:
@@ -470,36 +476,64 @@ class JumpDetector:
                     if shoulder_amp < shoulder_amp_th:
                         return out
 
-                # count
-                self.jump_count += 1
+                # ---------------- MISS-COUNT FIX (NEW) ----------------
+                # If dt is about 2x the expected cadence, assume one missed count.
+                add_extra = 0
+                if (
+                    dt is not None
+                    and self.cycle_expected_interval is not None
+                    and len(self.cycle_interval_hist) >= MISS_MIN_HISTORY
+                ):
+                    exp = float(self.cycle_expected_interval)
+                    if exp > 1e-6 and (MISS_2X_LOW * exp) <= dt <= (MISS_2X_HIGH * exp):
+                        # dt looks like ~2 jumps worth of time
+                        half = dt / 2.0
+
+                        # only apply if half itself still looks like a valid jump interval
+                        if MIN_JUMP_INTERVAL_SEC <= half <= MAX_JUMP_INTERVAL_SEC:
+                            add_extra = 1
+                            out["miss_fix_applied"] = True
+                            out["added_extra_count"] = 1
+
+                            # Insert a synthetic "missed" jump time at the midpoint:
+                            # prev_t ----(half)---- mid_t ----(half)---- t_sec
+                            mid_t = float(t_sec - half)
+                            if prev_t is not None:
+                                # keep ordering safe
+                                mid_t = max(prev_t + 1e-6, min(mid_t, t_sec - 1e-6))
+                                self.jump_times.append(mid_t)
+
+                            # update cadence as if we observed two normal intervals
+                            self._cadence_update_with_dt(half)
+                            self._cadence_update_with_dt(half)
+
+                # ---------------- COUNT (UPDATED) ----------------
+                # Normal: +1
+                # If miss-fix triggered: +2 (one inferred + this one)
+                self.jump_count += (1 + add_extra)
                 self.last_count_frame = frame_idx
                 self.jump_times.append(float(t_sec))
 
-                # update cadence EWMA + store expected_dt
-                if dt is not None:
-                    self.cycle_interval_hist.append(float(dt))
-                    if self.cycle_expected_interval is None:
-                        self.cycle_expected_interval = float(dt)
-                    else:
-                        self.cycle_expected_interval = float(
-                            (1.0 - EWMA_ALPHA) * self.cycle_expected_interval + EWMA_ALPHA * dt
-                        )
-                    out["expected_dt"] = float(self.cycle_expected_interval)
+                # cadence update for the normal case (when miss-fix did NOT already update)
+                if dt is not None and add_extra == 0:
+                    self._cadence_update_with_dt(float(dt))
+                out["expected_dt"] = float(self.cycle_expected_interval) if self.cycle_expected_interval is not None else float("nan")
 
-                # update HIP amp EWMA (unchanged)
+                # update HIP amp EWMA
                 if self.amp_ewma is None:
                     self.amp_ewma = float(hip_amp)
                 else:
                     self.amp_ewma = float((1.0 - AMP_EWMA_ALPHA) * self.amp_ewma + AMP_EWMA_ALPHA * hip_amp)
                 out["amp_ewma"] = float(self.amp_ewma)
 
-                # update SHOULDER amp EWMA (NEW)
+                # update SHOULDER amp EWMA
                 if not np.isnan(shoulder_amp):
                     if self.shoulder_amp_ewma is None:
                         self.shoulder_amp_ewma = float(shoulder_amp)
                     else:
                         self.shoulder_amp_ewma = float(
-                            (1.0 - SHO_AMP_EWMA_ALPHA) * self.shoulder_amp_ewma + SHO_AMP_EWMA_ALPHA * float(shoulder_amp)
+                            (1.0 - SHO_AMP_EWMA_ALPHA) * self.shoulder_amp_ewma
+                            + SHO_AMP_EWMA_ALPHA * float(shoulder_amp)
                         )
                     out["shoulder_amp_ewma"] = float(self.shoulder_amp_ewma)
 
@@ -556,23 +590,15 @@ class Track:
     prev_center: Tuple[float, float]
     prev_h: float
     color: Tuple[int, int, int]  # BGR
-
+    dts: List[float] = field(default_factory= list)
 
 class MultiPersonTracker:
-    """
-    ID stability improvements:
-    1) NMS removes duplicate detections per frame.
-    2) "Fallback reassociation": if a detection is unmatched, attach it to the nearest track
-       instead of instantly spawning a new ID (prevents ID switches after brief gate failures).
-    3) We never drop tracks (per your request).
-    """
-
     def __init__(
         self,
         fps: float,
         iou_gate: float = 0.10,
         center_gate_frac: float = 0.90,
-        height_gate: float = 0.55,   # more tolerant
+        height_gate: float = 0.55,
         fallback_dist_frac: float = 1.20,
     ):
         self.fps = float(fps)
@@ -604,6 +630,7 @@ class MultiPersonTracker:
             prev_center=(cx, cy),
             prev_h=hh,
             color=self._color_for(tid),
+            dts=[],
         )
 
     def _match_score(self, tr: Track, det57: np.ndarray, w: int, h: int) -> Optional[float]:
@@ -651,7 +678,7 @@ class MultiPersonTracker:
         assigned_dets = set()
         assignment: Dict[int, int] = {}
 
-        for s, tid, j in candidates:
+        for _, tid, j in candidates:
             if tid in assigned_tracks or j in assigned_dets:
                 continue
             assignment[tid] = j
@@ -664,7 +691,6 @@ class MultiPersonTracker:
 
             best_tid = None
             best_dist = 1e18
-
             for tid, tr in self.tracks.items():
                 if tid in assigned_tracks:
                     continue
@@ -774,8 +800,16 @@ def main():
             det["jump_count"] = tr.sm.update(t_sec, det["jump_count"])
             tr.detector.jump_count = det["jump_count"]
 
+            dt_val = det.get("dt", float("nan"))
+            if dt_val is not None and not np.isnan(dt_val):
+                tr.dts.append(float(dt_val))
+
             x1, y1, x2, y2 = bb
-            label = f"ID {tid} | Jump {det['jump_count']} | {tr.sm.state.value} | SPM {det['spm']:.1f} "
+            fix_flag = " +MISS" if det.get("miss_fix_applied", False) else ""
+            label = (
+                f"ID {tid} | Jump {det['jump_count']} | {tr.sm.state.value} | "
+                f"SPM {det['spm']:.1f}{fix_flag}"
+            )
             cv2.putText(
                 frame, label, (x1, max(18, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.4, tr.color, 7
@@ -792,11 +826,13 @@ def main():
                 "state": tr.sm.state.value,
                 "dt": det.get("dt", float("nan")),
                 "expected_dt": det.get("expected_dt", float("nan")),
+                "miss_fix_applied": bool(det.get("miss_fix_applied", False)),
+                "added_extra_count": int(det.get("added_extra_count", 0)),
                 "hip_amp": det.get("amp", float("nan")),
                 "shoulder_amp": det.get("shoulder_amp", float("nan")),
-                "shoulder_amp_th": det.get("shoulder_amp_th", float("nan")),          # NEW
-                "shoulder_noise_sigma": det.get("shoulder_noise_sigma", float("nan")),# NEW
-                "shoulder_amp_ewma": det.get("shoulder_amp_ewma", float("nan")),      # NEW
+                "shoulder_amp_th": det.get("shoulder_amp_th", float("nan")),
+                "shoulder_noise_sigma": det.get("shoulder_noise_sigma", float("nan")),
+                "shoulder_amp_ewma": det.get("shoulder_amp_ewma", float("nan")),
                 "amp_ewma": det.get("amp_ewma", float("nan")),
                 "lift_th": det.get("lift_th", float("nan")),
                 "lift_noise_sigma": det.get("lift_noise_sigma", float("nan")),
@@ -821,14 +857,27 @@ def main():
 
     print("DONE")
     if len(mp.tracks) == 0:
-        print("No tracks were created.")
+        print("No tracks are created at all")
+
     else:
-        all_counts = [(tid, tr.detector.jump_count) for tid, tr in mp.tracks.items()]
+        all_counts=[(tid, tr.detector.jump_count) for tid, tr in mp.tracks.items()]
         all_counts.sort(key=lambda x: x[1], reverse=True)
         top_k = all_counts[:4]
-        print("Top 4 jump counts:")
+        print("Top 4 jump counts")
         for rank, (tid, cnt) in enumerate(top_k, start=1):
-            print(f"  #{rank}: ID {tid} -> {cnt}")
+            print(f" #{rank}: ID {tid} -> {cnt}")
+
+    print("\n================DT LISTS PER TRACK==================")
+    if len(mp.tracks) == 0:
+        print("No tracks are created at all")
+    else:
+        for tid in sorted(mp.tracks.keys()):
+            tr = mp.tracks[tid]
+            if len(tr.dts) == 0:
+                print(f"ID {tid}: []")
+            else:
+                pretty = [round(x, 3) for x in tr.dts]
+                print(f"ID {tid}: {pretty}")
 
     print("Output video:", out_video_path)
     print("Output csv:", out_csv_path)
