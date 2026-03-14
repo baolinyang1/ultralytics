@@ -8,7 +8,7 @@ from scipy.signal import savgol_filter
 from openvino.runtime import Core
 
 MODEL_PATH = "model_int8.onnx"
-VIDEO_SOURCE = "TestVideos/107.2.mp4"
+VIDEO_SOURCE = "TestVideos/Still2.mp4"
 OUT_DIR = Path("onnx_video_results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
